@@ -512,22 +512,30 @@ async def adelete_by_entity(
                 # PHASE 1 — make the node's removal durable, and nothing else.
                 # Only a confirmed graph commit is a safe point to touch the
                 # authoritative tracking rows.
-                commit_cancel = None
-                try:
-                    await _commit_graph_or_raise(
-                        chunk_entity_relation_graph, f"Entity Delete: '{entity_name}'"
-                    )
-                except asyncio.CancelledError as exc:
-                    # Belt and braces for a cancellation raised INSIDE this
-                    # region. The caller's own cancellation does not arrive here
-                    # -- that is the point of running this as its own task -- so
-                    # on the file-backed path `commit_in_storage_io` finishes the
-                    # write and its notification hook and returns normally, and
-                    # the deferred cancel is re-raised to the caller afterwards.
-                    # This branch covers a direct cancellation of this task: the
-                    # graph may already be durably gone, so the tracking half
-                    # still has to run before cancellation is restored.
-                    commit_cancel = exc
+                # A `CancelledError` out of this await is NOT caught, and must
+                # not be. It carries no information about what landed, and the
+                # two cases it covers want opposite handling:
+                #
+                #   * cancelled before the write was submitted (waiting for a
+                #     storage-IO permit, e.g. at loop shutdown) -- nothing is
+                #     durable, so deleting the tracking rows would put an
+                #     immediate-write store's row in the grave while the node
+                #     survives on disk: the one state the purge recovery
+                #     contract forbids;
+                #   * cancelled while the write was in flight -- durable, so the
+                #     cleanup is owed.
+                #
+                # Reaching the line below is the only reliable evidence that the
+                # commit landed, so that is what the cleanup is predicated on.
+                # The caller's own cancellation never surfaces here -- it is
+                # deferred by the shield in `_finish_deferring_cancellation` and
+                # re-raised after this whole region returns -- so the case being
+                # given up is a DIRECT cancellation of this task mid-write. Its
+                # residue (node gone, relation rows stale) is the documented,
+                # recoverable one; the alternative is the forbidden one.
+                await _commit_graph_or_raise(
+                    chunk_entity_relation_graph, f"Entity Delete: '{entity_name}'"
+                )
 
                 if relation_keys_to_delete:
                     try:
@@ -553,9 +561,6 @@ async def adelete_by_entity(
                     entity_chunks_storage=entity_chunks_storage,
                     relation_chunks_storage=relation_chunks_storage,
                 )
-
-                if commit_cancel is not None:
-                    raise commit_cancel
 
             # The graph mutation, its durable commit and the tracking cleanup
             # are one cancellation-deferring region. commit_in_storage_io can
@@ -677,15 +682,13 @@ async def adelete_by_relation(
 
                 # Same ordered phases as adelete_by_entity — see there for why
                 # the graph commit must be confirmed before tracking is touched.
-                commit_cancel = None
-                try:
-                    await _commit_graph_or_raise(
-                        chunk_entity_relation_graph,
-                        f"Relation Delete: `{source_entity}`~`{target_entity}`",
-                    )
-                except asyncio.CancelledError as exc:
-                    # Same belt-and-braces as the entity path -- see there.
-                    commit_cancel = exc
+                # Not wrapped in a cancellation catch -- see the entity path
+                # for why reaching the next line is the only sound evidence that
+                # the commit landed.
+                await _commit_graph_or_raise(
+                    chunk_entity_relation_graph,
+                    f"Relation Delete: `{source_entity}`~`{target_entity}`",
+                )
 
                 if relation_chunks_storage is not None:
                     await relation_chunks_storage.delete([storage_key])
@@ -695,9 +698,6 @@ async def adelete_by_relation(
                 await _persist_graph_updates(
                     relation_chunks_storage=relation_chunks_storage,
                 )
-
-                if commit_cancel is not None:
-                    raise commit_cancel
 
             # Protect the graph mutation and commit as well as the owed cleanup;
             # the commit await itself is where deferred cancellation reappears.

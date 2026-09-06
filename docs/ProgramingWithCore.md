@@ -1522,6 +1522,13 @@ the write and its notification hook have landed. Cancelling a deletion therefore
 waits for the object's removal and its tracking cleanup to finish; only the
 vector flush is skipped.
 
+That protection covers the *caller*'s cancellation. Cancelling the deletion task
+itself — which the event loop does to every remaining task at shutdown — is not
+deferred, because the exception says nothing about whether the write had been
+submitted, and assuming it had would delete the tracking rows of a node whose
+removal never left memory. The cleanup therefore runs only once the commit has
+demonstrably returned.
+
 Every remaining failure state is therefore recoverable, and repeating the
 deletion is always the recovery step:
 
@@ -1530,7 +1537,7 @@ deletion is always the recovery step:
 | Graph commit | Entity live, rows live | Consistent; retry the deletion |
 | Tracking delete or commit | Entity gone, its row stale | Retry: a deletion reporting `not_found` sweeps a stale row for that name and flushes pending tracking state whether or not a row is still visible in memory |
 | A failing tracking delete leaves incident relation rows of an entity deletion | Entity gone, relation rows stale | Not reachable automatically — the node is gone, so its edges are unknowable. Logged with the exact storage keys; delete the relation directly to sweep its row |
-| Process exit between the graph commit and the tracking commit, on a **deferred** tracking backend (JSON) | Entity gone, its rows and its relations' rows stale | The entity's own row is swept by a repeated deletion; its incident relation rows are not, and their keys are not logged because nothing failed. Delete the relations directly, or rebuild tracking. Not closed by this staging — an immediate-write tracking store (Redis/PG/Mongo) is not exposed to it |
+| The cleanup never runs although the graph commit landed — process exit before a **deferred** tracking backend (JSON) flushes, the graph backend's commit notification raising after the write, or a direct cancellation of the deletion task mid-write | Entity gone, its rows and its relations' rows stale | The entity's own row is swept by a repeated deletion; its incident relation rows are not, and their keys are not logged because nothing failed. Delete the relations directly, or rebuild tracking. Not closed by this staging: the file-backed commit layer cannot tell a caller what landed |
 | Vector flush | Entity and rows gone, vector record stale | The rebuildable window this codebase accepts elsewhere; `lightrag-rebuild-vdb` restores it |
 
 ### Delete Relations

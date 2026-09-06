@@ -672,25 +672,35 @@ class TestCancellationAfterTheCommit:
     """
 
     @staticmethod
-    def _cancel_right_after_commit(fixture, monkeypatch):
+    def _cancel_right_after_commit(fixture, monkeypatch, owner):
         original = fixture.graph.index_done_callback
 
         async def _commit_then_cancel():
-            await original()
-            # Match commit_in_storage_io: once the write and commit hook finish,
-            # it raises the cancellation from this phase-1 await itself.
-            raise asyncio.CancelledError
+            result = await original()
+            # The CALLER's task, never `current_task()` and never a bare raise:
+            # the owed cleanup runs in a task of its own, so cancelling from the
+            # inside models a worker aborting its own work rather than a caller
+            # being cancelled -- a different scenario, handled differently (see
+            # TestDirectCancellationBeforeTheCommit).
+            owner["task"].cancel()
+            return result
 
         monkeypatch.setattr(fixture.graph, "index_done_callback", _commit_then_cancel)
+
+    @staticmethod
+    async def _run_cancelled(coro, owner):
+        owner["task"] = asyncio.ensure_future(coro)
+        with pytest.raises(asyncio.CancelledError):
+            await owner["task"]
 
     @pytest.mark.asyncio
     async def test_entity_tracking_is_cleaned_despite_the_cancel(
         self, rag, monkeypatch
     ):
-        self._cancel_right_after_commit(rag, monkeypatch)
+        owner: dict = {}
+        self._cancel_right_after_commit(rag, monkeypatch, owner)
 
-        with pytest.raises(asyncio.CancelledError):
-            await rag.delete_entity()
+        await self._run_cancelled(rag.delete_entity(), owner)
 
         # The node is durably gone, so every row it owned must be gone too.
         assert not rag.persisted_graph().has_node(ENTITY)
@@ -702,10 +712,10 @@ class TestCancellationAfterTheCommit:
     async def test_relation_tracking_is_cleaned_despite_the_cancel(
         self, rag, monkeypatch
     ):
-        self._cancel_right_after_commit(rag, monkeypatch)
+        owner: dict = {}
+        self._cancel_right_after_commit(rag, monkeypatch, owner)
 
-        with pytest.raises(asyncio.CancelledError):
-            await rag.delete_relation()
+        await self._run_cancelled(rag.delete_relation(), owner)
 
         assert not rag.persisted_graph().has_edge(ENTITY, OTHER)
         assert RELATION_KEY not in rag.relation_chunks.records
@@ -811,3 +821,65 @@ class TestCancellationDuringTheGraphCommit:
         assert not await rag.graph.has_node(ENTITY)
         assert ENTITY not in rag.entity_chunks.records
         assert RELATION_KEY not in rag.relation_chunks.records
+
+
+class TestDirectCancellationBeforeTheCommit:
+    """A cancel with nothing durable yet must not delete the tracking rows.
+
+    The graph mutation, its commit and the tracking cleanup run as a task of
+    their own so the CALLER's cancellation cannot cut them apart. That task can
+    still be cancelled directly -- the event loop cancels every remaining task at
+    shutdown -- and such a cancel is indistinguishable, from the exception alone,
+    between two opposite situations: the write was already in flight (durable, so
+    the cleanup is owed) and the write was never submitted, because
+    `_bounded_submit_impl` leaves the permit wait cancellable precisely so that a
+    cancelled caller leaves no work behind.
+
+    Treating both as "the graph committed" is the dangerous direction. With an
+    immediate-write tracking store the rows die durably while the node removal is
+    only in memory, so the process leaves behind a live on-disk object with no
+    provenance -- the state the purge recovery contract forbids, and the one from
+    which a later purge concludes "no remaining sources". Giving up the cleanup in
+    the durable case instead leaves the residue this staging already documents.
+    """
+
+    @staticmethod
+    def _cancel_the_region_before_it_commits(fixture, monkeypatch):
+        async def _cancel_without_committing():
+            # Inside the region, `current_task()` IS the region's own task. The
+            # original callback is never called, standing in for a cancellation
+            # delivered while waiting for a storage-IO permit: nothing submitted,
+            # nothing durable.
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(
+            fixture.graph, "index_done_callback", _cancel_without_committing
+        )
+
+    @pytest.mark.asyncio
+    async def test_entity_rows_survive_a_cancel_with_nothing_committed(
+        self, rag, monkeypatch
+    ):
+        self._cancel_the_region_before_it_commits(rag, monkeypatch)
+
+        with pytest.raises(asyncio.CancelledError):
+            await rag.delete_entity()
+
+        # The node never reached disk, so every row describing it must still be
+        # there: the deletion is simply retryable.
+        assert rag.persisted_graph().has_node(ENTITY)
+        assert rag.entity_chunks.records[ENTITY] == CHUNKS
+        assert rag.relation_chunks.records[RELATION_KEY] == CHUNKS
+
+    @pytest.mark.asyncio
+    async def test_relation_row_survives_a_cancel_with_nothing_committed(
+        self, rag, monkeypatch
+    ):
+        self._cancel_the_region_before_it_commits(rag, monkeypatch)
+
+        with pytest.raises(asyncio.CancelledError):
+            await rag.delete_relation()
+
+        assert rag.persisted_graph().has_edge(ENTITY, OTHER)
+        assert rag.relation_chunks.records[RELATION_KEY] == CHUNKS
