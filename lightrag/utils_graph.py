@@ -309,6 +309,31 @@ async def _persist_graph_updates(
         )
 
 
+async def _sweep_orphan_tracking_row(
+    tracking_storage, storage_key: str, description: str
+) -> bool:
+    """Drop a chunk-tracking row whose graph object no longer exists.
+
+    Returns True when a row was found and deleted, so the caller can skip the
+    flush on the common case of nothing to sweep. Presence is tested with a plain
+    ``is not None`` rather than :func:`has_chunk_tracking_row`: a legacy or
+    partial row (``{}``, ``{"count": 0}``) is still stored attribution for an
+    object that is gone, and sweeping it is exactly as correct as sweeping a
+    well-formed one. A backend error is NOT swallowed: it reaches the caller's
+    generic handler, so a missing object whose tracking backend is down reports
+    ``fail``/500 rather than ``not_found``/404. That is deliberate — a 404 over a
+    row this call failed to sweep would be a silent failure, while a 500 tells
+    the caller to retry, which is what makes the ordering converge.
+    """
+    if tracking_storage is None:
+        return False
+    if await tracking_storage.get_by_id(storage_key) is None:
+        return False
+    await tracking_storage.delete([storage_key])
+    logger.info(f"Delete: swept orphan chunk tracking row for {description}")
+    return True
+
+
 async def adelete_by_entity(
     chunk_entity_relation_graph,
     entities_vdb,
@@ -320,6 +345,17 @@ async def adelete_by_entity(
     """Asynchronously delete an entity and all its relationships.
 
     Also cleans up entity_chunks_storage and relation_chunks_storage to remove chunk tracking.
+
+    Tracking rows are removed only AFTER the graph node is gone, matching the
+    ordering of the document purge path. The reverse order is forbidden by the
+    purge recovery contract: a tracking row is the authoritative attribution
+    carrier, so dropping it while the object survives (a transient vector or
+    graph failure below) leaves a live entity whose provenance has silently
+    degraded to the truncated graph ``source_id`` — from which a later purge can
+    conclude "no remaining sources" and delete an entity other documents still
+    reference. The residual window of the ordering used here is the inverse and
+    strictly milder: an orphan tracking row whose object is already gone, which
+    the ``not_found`` sweep below converges on retry.
 
     Args:
         chunk_entity_relation_graph: Graph storage instance
@@ -343,6 +379,20 @@ async def adelete_by_entity(
             # Check if the entity exists
             if not await chunk_entity_relation_graph.has_node(entity_name):
                 logger.warning(f"Entity '{entity_name}' not found.")
+                # An absent node with a surviving tracking row is by definition
+                # an orphan: a previous deletion removed the node but failed
+                # before its tracking row, or an older release never cleaned up
+                # at all. Sweeping it here is what makes the ordering
+                # documented in the docstring converge on retry. Only this
+                # entity's own row can be reached —
+                # the node is gone, so its incident edges are unknowable.
+                swept = await _sweep_orphan_tracking_row(
+                    entity_chunks_storage, entity_name, f"entity `{entity_name}`"
+                )
+                if swept:
+                    await _persist_graph_updates(
+                        entity_chunks_storage=entity_chunks_storage
+                    )
                 return DeletionResult(
                     status="not_found",
                     doc_id=entity_name,
@@ -353,36 +403,47 @@ async def adelete_by_entity(
             edges = await chunk_entity_relation_graph.get_node_edges(entity_name)
             related_relations_count = len(edges) if edges else 0
 
-            # Clean up chunk tracking storages before deletion
+            # Resolve the incident relation keys while the edges are still
+            # readable; the rows themselves are deleted after the node below.
+            relation_keys_to_delete: list[str] = []
+            if relation_chunks_storage is not None and edges:
+                from .utils import make_relation_chunk_key
+
+                for src, tgt in edges:
+                    # Normalize entity order for consistent key generation
+                    normalized_src, normalized_tgt = sorted([src, tgt])
+                    relation_keys_to_delete.append(
+                        make_relation_chunk_key(normalized_src, normalized_tgt)
+                    )
+
+            await entities_vdb.delete_entity(entity_name)
+            await relationships_vdb.delete_entity_relation(entity_name)
+            await chunk_entity_relation_graph.delete_node(entity_name)
+
+            # Chunk tracking cleanup, relation rows first: a failure after the
+            # entity row is gone still converges (a retry hits the not_found
+            # sweep), while an orphaned relation row is unreachable once the
+            # node is deleted. Give the unrecoverable step the earliest slot and
+            # name its keys in the log if it fails.
+            if relation_keys_to_delete:
+                try:
+                    await relation_chunks_storage.delete(relation_keys_to_delete)
+                except Exception:
+                    logger.error(
+                        "Entity Delete: failed to remove relation chunk tracking; "
+                        f"these rows are now orphaned: {relation_keys_to_delete}"
+                    )
+                    raise
+                logger.info(
+                    f"Entity Delete: removed chunk tracking for {len(relation_keys_to_delete)} relations"
+                )
+
             if entity_chunks_storage is not None:
                 # Delete entity's entry from entity_chunks_storage
                 await entity_chunks_storage.delete([entity_name])
                 logger.info(
                     f"Entity Delete: removed chunk tracking for `{entity_name}`"
                 )
-
-            if relation_chunks_storage is not None and edges:
-                # Delete all related relationships from relation_chunks_storage
-                from .utils import make_relation_chunk_key
-
-                relation_keys_to_delete = []
-                for src, tgt in edges:
-                    # Normalize entity order for consistent key generation
-                    normalized_src, normalized_tgt = sorted([src, tgt])
-                    storage_key = make_relation_chunk_key(
-                        normalized_src, normalized_tgt
-                    )
-                    relation_keys_to_delete.append(storage_key)
-
-                if relation_keys_to_delete:
-                    await relation_chunks_storage.delete(relation_keys_to_delete)
-                    logger.info(
-                        f"Entity Delete: removed chunk tracking for {len(relation_keys_to_delete)} relations"
-                    )
-
-            await entities_vdb.delete_entity(entity_name)
-            await relationships_vdb.delete_entity_relation(entity_name)
-            await chunk_entity_relation_graph.delete_node(entity_name)
 
             message = f"Entity Delete: remove '{entity_name}' and its {related_relations_count} relations"
             logger.info(message)
@@ -421,6 +482,11 @@ async def adelete_by_relation(
 
     Also cleans up relation_chunks_storage to remove chunk tracking.
 
+    As in :func:`adelete_by_entity`, the tracking row is removed only after the
+    edge itself is gone, so a failure can never strand a live relation without
+    its authoritative provenance; the inverse residue (an orphan row) is swept
+    by the ``not_found`` branch on the next attempt.
+
     Args:
         chunk_entity_relation_graph: Graph storage instance
         relationships_vdb: Vector database storage for relationships
@@ -445,27 +511,29 @@ async def adelete_by_relation(
             edge_exists = await chunk_entity_relation_graph.has_edge(
                 source_entity, target_entity
             )
+            from .utils import make_relation_chunk_key
+
+            # Normalize entity order for consistent key generation
+            normalized_src, normalized_tgt = sorted([source_entity, target_entity])
+            storage_key = make_relation_chunk_key(normalized_src, normalized_tgt)
+
             if not edge_exists:
                 message = f"Relation from '{source_entity}' to '{target_entity}' does not exist"
                 logger.warning(message)
+                swept = await _sweep_orphan_tracking_row(
+                    relation_chunks_storage,
+                    storage_key,
+                    f"relation `{normalized_src}`~`{normalized_tgt}`",
+                )
+                if swept:
+                    await _persist_graph_updates(
+                        relation_chunks_storage=relation_chunks_storage
+                    )
                 return DeletionResult(
                     status="not_found",
                     doc_id=relation_str,
                     message=message,
                     status_code=404,
-                )
-
-            # Clean up chunk tracking storage before deletion
-            if relation_chunks_storage is not None:
-                from .utils import make_relation_chunk_key
-
-                # Normalize entity order for consistent key generation
-                normalized_src, normalized_tgt = sorted([source_entity, target_entity])
-                storage_key = make_relation_chunk_key(normalized_src, normalized_tgt)
-
-                await relation_chunks_storage.delete([storage_key])
-                logger.info(
-                    f"Relation Delete: removed chunk tracking for `{source_entity}`~`{target_entity}`"
                 )
 
             # Delete relation from vector database
@@ -480,6 +548,15 @@ async def adelete_by_relation(
             await chunk_entity_relation_graph.remove_edges(
                 [(source_entity, target_entity)]
             )
+
+            # Chunk tracking cleanup runs only after the edge is gone (see the
+            # docstring): a failure here leaves an orphan row the next attempt
+            # sweeps, never a live edge without its provenance.
+            if relation_chunks_storage is not None:
+                await relation_chunks_storage.delete([storage_key])
+                logger.info(
+                    f"Relation Delete: removed chunk tracking for `{source_entity}`~`{target_entity}`"
+                )
 
             message = f"Relation Delete: `{source_entity}`~`{target_entity}` deleted successfully"
             logger.info(message)

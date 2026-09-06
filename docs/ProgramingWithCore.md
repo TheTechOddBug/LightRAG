@@ -1504,6 +1504,14 @@ When deleting an entity:
 - Deletes and persists the entity and incident-relation chunk-tracking rows, so recreating the entity does not inherit pre-deletion provenance
 - Maintains knowledge graph integrity
 
+Chunk-tracking rows are removed only after the graph node itself is gone, so a
+backend failure mid-deletion can never leave a live entity without its
+authoritative provenance. The inverse residue — a tracking row whose entity is
+already deleted — is swept by repeating the call: a deletion that reports
+`not_found` still drops a stale row for that entity name. Incident relation rows
+are not reachable once the node is gone, so a failure that strands them is
+logged with the exact storage keys.
+
 ### Delete Relations
 
 ```python
@@ -1519,6 +1527,10 @@ When deleting a relationship:
 - Deletes the relationship's embedding vector
 - Deletes and persists its chunk-tracking row regardless of endpoint order, so recreating the relation starts with new provenance
 - Preserves both entity nodes and their other relationships
+
+As with entity deletion, the tracking row is removed after the edge, and
+repeating a deletion that reports `not_found` sweeps a stale row left by an
+earlier partial failure.
 
 ### Delete by Document ID
 
