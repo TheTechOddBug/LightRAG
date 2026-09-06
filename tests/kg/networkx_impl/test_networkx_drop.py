@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +53,7 @@ async def test_drop_stays_successful_when_peer_notification_fails(
         assert Path(storage._graphml_xml_file).exists()
 
         async def notification_boom(namespace, workspace=None):
+            storage.storage_updated.value = True
             raise RuntimeError("notification boom")
 
         monkeypatch.setattr(networkx_impl, "set_all_update_flags", notification_boom)
@@ -87,5 +89,77 @@ async def test_drop_reports_a_destructive_file_failure(tmp_path, monkeypatch):
         assert result == {"status": "error", "message": "delete boom"}
         assert Path(storage._graphml_xml_file).exists()
         assert storage._graph.has_node("n1")
+    finally:
+        await storage.finalize()
+
+
+@pytest.mark.asyncio
+async def test_drop_blocks_peer_reads_until_notification_completes(
+    tmp_path, monkeypatch
+):
+    writer = _make_storage(tmp_path)
+    await writer.initialize()
+    await writer.upsert_node("n1", {"entity_id": "n1"})
+    await writer.index_done_callback()
+    peer = _make_storage(tmp_path)
+    await peer.initialize()
+    notification_started = asyncio.Event()
+    allow_notification = asyncio.Event()
+    notify = networkx_impl.set_all_update_flags
+
+    async def paused_notification(namespace, workspace=None):
+        notification_started.set()
+        await allow_notification.wait()
+        await notify(namespace, workspace=workspace)
+
+    monkeypatch.setattr(networkx_impl, "set_all_update_flags", paused_notification)
+    drop_task = asyncio.create_task(writer.drop())
+    read_task = None
+    try:
+        await asyncio.wait_for(notification_started.wait(), timeout=2)
+        assert not Path(writer._graphml_xml_file).exists()
+        read_task = asyncio.create_task(peer.has_node("n1"))
+        # A reader arriving after deletion must wait for the reload signal.
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(read_task), timeout=0.1)
+        allow_notification.set()
+        assert (await asyncio.wait_for(drop_task, timeout=2))["status"] == "success"
+        assert await asyncio.wait_for(read_task, timeout=2) is False
+        assert writer.storage_updated.value is False
+    finally:
+        allow_notification.set()
+        await asyncio.gather(drop_task, *([read_task] if read_task else []))
+        await peer.finalize()
+        await writer.finalize()
+
+
+@pytest.mark.asyncio
+async def test_drop_stays_successful_when_writer_flag_reset_fails(
+    tmp_path, monkeypatch
+):
+    storage = _make_storage(tmp_path)
+    await storage.initialize()
+    try:
+        await storage.upsert_node("n1", {"entity_id": "n1"})
+        await storage.index_done_callback()
+
+        class BrokenResetFlag:
+            @property
+            def value(self):
+                return True
+
+            @value.setter
+            def value(self, value):
+                raise RuntimeError("reset boom")
+
+        monkeypatch.setattr(storage, "storage_updated", BrokenResetFlag())
+        logged_errors = []
+        monkeypatch.setattr(networkx_impl.logger, "error", logged_errors.append)
+        result = await storage.drop()
+
+        assert result == {"status": "success", "message": "data dropped"}
+        assert not Path(storage._graphml_xml_file).exists()
+        assert storage._graph.number_of_nodes() == 0
+        assert any("reset boom" in msg for msg in logged_errors)
     finally:
         await storage.finalize()
