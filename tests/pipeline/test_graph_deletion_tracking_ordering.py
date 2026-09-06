@@ -575,3 +575,74 @@ class TestDeclinedGraphCommitIsAFailure:
         assert result.status == "success"
         assert ENTITY not in rag.entity_chunks.records
         assert RELATION_KEY not in rag.relation_chunks.records
+
+
+class TestFailedGraphSaveDoesNotStrandProvenance:
+    """A raised graph save must not turn the retry into a provenance wipe.
+
+    `NetworkXStorage.index_done_callback` used to re-raise without restoring
+    `self._graph`, so the node stayed removed in memory while the file still had
+    it -- and nothing repaired that (a failed write never sets
+    `storage_updated`, so the reload branch never fires). The retry then read
+    `has_node` as False, took the not_found branch, and swept the authoritative
+    tracking row of a node that is still on disk.
+    """
+
+    @pytest.mark.asyncio
+    async def test_entity_delete_retry_converges_after_a_failed_save(
+        self, rag, monkeypatch
+    ):
+        original = NetworkXStorage.write_nx_graph
+        armed = {"boom": True}
+
+        def _write(graph, file_name, workspace):
+            if armed["boom"]:
+                armed["boom"] = False
+                raise OSError("No space left on device")
+            return original(graph, file_name, workspace)
+
+        monkeypatch.setattr(NetworkXStorage, "write_nx_graph", staticmethod(_write))
+
+        first = await rag.delete_entity()
+
+        assert first.status == "fail"
+        assert rag.persisted_graph().has_node(ENTITY)
+        assert rag.entity_chunks.records[ENTITY] == CHUNKS
+        assert rag.relation_chunks.records[RELATION_KEY] == CHUNKS
+
+        second = await rag.delete_entity()
+
+        # The retry deletes for real instead of mistaking a stale in-memory
+        # view for a durable removal.
+        assert second.status == "success"
+        assert not rag.persisted_graph().has_node(ENTITY)
+        assert ENTITY not in rag.entity_chunks.records
+        assert RELATION_KEY not in rag.relation_chunks.records
+        assert rag.entity_chunks.records[OTHER] == CHUNKS
+
+    @pytest.mark.asyncio
+    async def test_relation_delete_retry_converges_after_a_failed_save(
+        self, rag, monkeypatch
+    ):
+        original = NetworkXStorage.write_nx_graph
+        armed = {"boom": True}
+
+        def _write(graph, file_name, workspace):
+            if armed["boom"]:
+                armed["boom"] = False
+                raise OSError("No space left on device")
+            return original(graph, file_name, workspace)
+
+        monkeypatch.setattr(NetworkXStorage, "write_nx_graph", staticmethod(_write))
+
+        first = await rag.delete_relation()
+
+        assert first.status == "fail"
+        assert rag.persisted_graph().has_edge(ENTITY, OTHER)
+        assert rag.relation_chunks.records[RELATION_KEY] == CHUNKS
+
+        second = await rag.delete_relation()
+
+        assert second.status == "success"
+        assert not rag.persisted_graph().has_edge(ENTITY, OTHER)
+        assert RELATION_KEY not in rag.relation_chunks.records
