@@ -1511,7 +1511,11 @@ The graph object's removal is committed first, on its own; only then are the
 tracking rows deleted and committed; the vector storages are flushed last. This
 holds for any mix of backends, including a deferred graph with an immediate-write
 tracking store, which is why the staging is by *durability* rather than by call
-order.
+order. Before removing an entity node, LightRAG also commits a reserved cleanup
+journal containing its incident relation keys. The journal is retired only after
+those tracking rows are deleted; if their commit fails and the process restarts, the `not_found`
+retry replays the journal even though the deleted node can no longer reveal its
+edges.
 
 Every remaining failure state is therefore recoverable, and repeating the
 deletion is always the recovery step:
@@ -1520,7 +1524,8 @@ deletion is always the recovery step:
 | --- | --- | --- |
 | Graph commit | Entity live, rows live | Consistent; retry the deletion |
 | Tracking delete or commit | Entity gone, its row stale | Retry: a deletion reporting `not_found` sweeps a stale row for that name and flushes pending tracking state whether or not a row is still visible in memory |
-| A failing tracking delete leaves incident relation rows of an entity deletion | Entity gone, relation rows stale | Not reachable automatically — the node is gone, so its edges are unknowable. Logged with the exact storage keys; delete the relation directly to sweep its row. A cancellation cannot reach this state: once the graph commit lands, the cleanup runs to completion before the cancellation is re-raised |
+| Entity relation-tracking delete or commit | Entity gone, incident relation rows stale | Retry: the durable cleanup journal preserves the relation keys across restart, and the `not_found` path deletes those rows and the journal together |
+| Cancellation during the graph commit | Commit outcome may already be durable | The graph commit and tracking cleanup run in one cancellation-deferring region; cancellation is re-raised only after any owed cleanup finishes |
 | Vector flush | Entity and rows gone, vector record stale | The rebuildable window this codebase accepts elsewhere; `lightrag-rebuild-vdb` restores it |
 
 ### Delete Relations

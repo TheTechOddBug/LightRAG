@@ -349,6 +349,25 @@ def _log_graph_commit(fixture, monkeypatch, *, fail: bool):
     monkeypatch.setattr(fixture.graph, "index_done_callback", _commit)
 
 
+def _fail_relation_cleanup_commit_once(fixture, monkeypatch):
+    """Let the deletion WAL commit, then fail the relation-row cleanup commit."""
+    original_commit = fixture.relation_chunks.index_done_callback
+    commit_calls = 0
+
+    async def fail_cleanup_commit_once():
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls == 2:
+            raise _Boom("relation_chunks cleanup commit failed")
+        await original_commit()
+
+    monkeypatch.setattr(
+        fixture.relation_chunks,
+        "index_done_callback",
+        fail_cleanup_commit_once,
+    )
+
+
 class TestDurableCommitOrdering:
     """The graph must reach disk before the tracking rows do."""
 
@@ -365,7 +384,8 @@ class TestDurableCommitOrdering:
         # its tracking rows must still be on disk with it.
         assert deferred.entity_chunks.disk[ENTITY] == CHUNKS
         assert deferred.relation_chunks.disk[RELATION_KEY] == CHUNKS
-        assert deferred.commit_log == ["graph"]
+        # The relation-tracking WAL is durable before the graph commit begins.
+        assert deferred.commit_log == ["relation_chunks", "graph"]
 
     @pytest.mark.asyncio
     async def test_relation_graph_commit_failure_keeps_row_on_disk(
@@ -392,8 +412,8 @@ class TestDurableCommitOrdering:
         result = await deferred.delete_entity()
 
         assert result.status == "success"
-        assert deferred.commit_log[0] == "graph"
-        assert set(deferred.commit_log[1:]) == {"entity_chunks", "relation_chunks"}
+        assert deferred.commit_log[:2] == ["relation_chunks", "graph"]
+        assert set(deferred.commit_log[2:]) == {"entity_chunks", "relation_chunks"}
         assert ENTITY not in deferred.entity_chunks.disk
         assert RELATION_KEY not in deferred.relation_chunks.disk
 
@@ -499,15 +519,41 @@ class TestFailedCommitsAreRetried:
         assert deferred.entity_chunks.disk[OTHER] == CHUNKS
 
     @pytest.mark.asyncio
-    async def test_entity_retry_commits_pending_relation_rows(self, deferred):
+    async def test_entity_retry_commits_pending_relation_rows(
+        self, deferred, monkeypatch
+    ):
         # The incident relation rows are deleted in the same phase; a retry that
         # only ever considers the entity's own row must still flush them.
-        deferred.relation_chunks.fail_commit_times = 1
+        _fail_relation_cleanup_commit_once(deferred, monkeypatch)
 
         first = await deferred.delete_entity()
 
         assert first.status == "fail"
         assert RELATION_KEY in deferred.relation_chunks.disk
+
+        second = await deferred.delete_entity()
+
+        assert second.status == "not_found"
+        assert RELATION_KEY not in deferred.relation_chunks.disk
+        journal_key = utils_graph._entity_delete_journal_key(ENTITY)
+        assert journal_key not in deferred.relation_chunks.disk
+
+    @pytest.mark.asyncio
+    async def test_entity_retry_after_restart_commits_pending_relation_rows(
+        self, deferred, monkeypatch
+    ):
+        _fail_relation_cleanup_commit_once(deferred, monkeypatch)
+
+        first = await deferred.delete_entity()
+
+        assert first.status == "fail"
+        assert RELATION_KEY in deferred.relation_chunks.disk
+
+        # A restart discards the uncommitted in-memory deletion and its dirty
+        # flag. The retry can no longer recover incident edge keys from the
+        # graph because the node deletion is already durable.
+        deferred.entity_chunks.records = deepcopy(deferred.entity_chunks.disk)
+        deferred.relation_chunks.records = deepcopy(deferred.relation_chunks.disk)
 
         second = await deferred.delete_entity()
 
@@ -676,9 +722,10 @@ class TestCancellationAfterTheCommit:
         original = fixture.graph.index_done_callback
 
         async def _commit_then_cancel():
-            result = await original()
-            asyncio.current_task().cancel()
-            return result
+            await original()
+            # Match commit_in_storage_io: once the write and commit hook finish,
+            # it raises the cancellation from this phase-1 await itself.
+            raise asyncio.CancelledError
 
         monkeypatch.setattr(fixture.graph, "index_done_callback", _commit_then_cancel)
 

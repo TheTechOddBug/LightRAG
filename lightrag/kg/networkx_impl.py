@@ -1023,6 +1023,13 @@ class NetworkXStorage(BaseGraphStorage):
                     # Report, never mask: the save error is what the caller
                     # must see, and a failed reload leaves the divergence in
                     # place, so it has to be visible in the log on its own.
+                    # Keep the reload flag armed as a recovery fence: every
+                    # later public graph operation enters through _get_graph,
+                    # which will retry the disk reload before trusting this
+                    # process-local view. Without the flag, a deletion retry
+                    # could mistake the unpersisted mutation for durable state
+                    # and sweep the live object's tracking row.
+                    self.storage_updated.value = True
                     logger.error(
                         f"[{self.workspace}] Failed to restore the in-memory "
                         f"graph after a failed save; it may not match "

@@ -102,6 +102,50 @@ async def test_failed_save_restores_the_in_memory_graph(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_failed_save_retries_restore_when_the_first_reload_fails(
+    tmp_path, monkeypatch
+):
+    storage = _make_storage(tmp_path)
+    await storage.initialize()
+    try:
+        await storage.upsert_node("n1", {"entity_id": "n1", "description": "x"})
+        await storage.index_done_callback()
+        await storage.delete_node("n1")
+
+        original_write = NetworkXStorage.write_nx_graph
+        original_load = NetworkXStorage.load_nx_graph
+        reload_attempts = 0
+
+        def save_boom(graph, file_name, workspace):
+            raise OSError("save boom")
+
+        def first_reload_boom(file_name):
+            nonlocal reload_attempts
+            reload_attempts += 1
+            if reload_attempts == 1:
+                raise OSError("reload boom")
+            return original_load(file_name)
+
+        monkeypatch.setattr(NetworkXStorage, "write_nx_graph", staticmethod(save_boom))
+        monkeypatch.setattr(
+            NetworkXStorage, "load_nx_graph", staticmethod(first_reload_boom)
+        )
+        with pytest.raises(OSError, match="save boom"):
+            await storage.index_done_callback()
+
+        monkeypatch.setattr(
+            NetworkXStorage, "write_nx_graph", staticmethod(original_write)
+        )
+
+        # The next read must retry the restore instead of trusting the deleted
+        # process-local graph that never reached disk.
+        assert await storage.has_node("n1")
+        assert reload_attempts == 2
+    finally:
+        await storage.finalize()
+
+
+@pytest.mark.asyncio
 async def test_a_failed_save_does_not_publish_the_batch_on_the_next_commit(
     tmp_path, monkeypatch
 ):
