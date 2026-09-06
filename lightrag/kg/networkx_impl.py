@@ -972,13 +972,32 @@ class NetworkXStorage(BaseGraphStorage):
                 # call time on purpose: test_networkx_index_done.py monkeypatches
                 # write_nx_graph, and hoisting the reference would leave that
                 # test green while testing nothing.
+                publish_error: list[Exception] = []
+
                 async def _committed() -> None:
                     # Runs inside the same uncancellable region as the write,
                     # and only if the write landed. Inlined after the offload it
                     # would be skippable by a cancel, leaving the new GraphML
                     # published while every other process keeps reading the
                     # previous one until some later commit happens to notify it.
-                    await set_all_update_flags(self.namespace, workspace=self.workspace)
+                    try:
+                        await set_all_update_flags(
+                            self.namespace, workspace=self.workspace
+                        )
+                    except Exception as e:
+                        # Recorded, never raised. Reaching this line means the
+                        # write already landed (`on_committed` runs only after
+                        # `fn` succeeded), so only the cross-process reload
+                        # notification failed: other workers keep reading the
+                        # previous snapshot until the next commit anywhere flips
+                        # their flags. That is a visibility lag, not a lost
+                        # write. Raising it would report a durable mutation as
+                        # a failed one, and every caller inherits that lie --
+                        # the deletion paths in utils_graph skip the tracking
+                        # retirement they still owe (leaving a vanished object's
+                        # authoritative rows behind), and _insert_done marks a
+                        # document FAILED whose graph writes are on disk.
+                        publish_error.append(e)
                     # Reset own update flag to avoid self-reloading
                     self.storage_updated.value = False
 
@@ -988,8 +1007,24 @@ class NetworkXStorage(BaseGraphStorage):
                     ),
                     _committed,
                 )
+                if publish_error:
+                    logger.error(
+                        f"[{self.workspace}] Graph saved to "
+                        f"{self._graphml_xml_file}, but one or more other "
+                        f"processes could not be notified to reload it: "
+                        f"{publish_error[0]}. The notification flips one flag "
+                        "per process, so an unknown remainder of them keeps "
+                        "reading the previous snapshot until the next commit "
+                        "notifies them."
+                    )
                 return True  # Return success
             except Exception as e:
+                # Only a genuine write failure reaches here. A failure of the
+                # publication hook is recorded above and does not raise: the
+                # file is already on disk by the time that hook runs, so the
+                # recovery reload below -- and the "the write did not land"
+                # reasoning it rests on -- would both be wrong for it.
+                #
                 # Raise (do NOT swallow + return False): _insert_done's
                 # _flush_one only detects failures via exceptions, so a
                 # swallowed graph-save error would let the document be marked

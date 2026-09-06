@@ -220,6 +220,22 @@ class _Fixture:
 
         monkeypatch.setattr(self.graph, "index_done_callback", _logged)
 
+    def fail_publication(self, monkeypatch, *, after: int = 0):
+        """Make the cross-process reload notification fail after a real write.
+
+        `commit_in_storage_io` runs the hook only once the GraphML write
+        succeeded, so this models the one failure mode in which the graph
+        mutation IS durable while the commit reports trouble.
+        """
+        calls = {"n": 0}
+
+        async def _flags(namespace, workspace=None):
+            calls["n"] += 1
+            if calls["n"] > after:
+                raise _Boom("shared-storage manager is down")
+
+        monkeypatch.setattr("lightrag.kg.networkx_impl.set_all_update_flags", _flags)
+
     def cancel_caller_on_graph_commit(self, monkeypatch, caller, *, after: int = 0):
         """Cancel ``caller`` from inside a graph commit that really landed.
 
@@ -619,3 +635,45 @@ class TestImmediateWriteBackendsRemoveTheNodeInsideTheRegion:
         assert SOURCE not in immediate_rag.persisted_graph().nodes()
         assert _rows_without_live_objects(immediate_rag) == []
         assert _live_objects_without_rows(immediate_rag) == []
+
+
+class TestADurableWriteWhoseNotificationFailedIsStillDurable:
+    """The retirement is owed whenever the mutation landed, however it reported.
+
+    NetworkX publishes the GraphML file and then tells the other processes to
+    reload it. The second step runs only if the write succeeded, so a failure
+    there leaves the object durably gone -- and used to surface as a raise, at
+    which point both paths reported "the sources were NOT removed" and skipped
+    the retirement of rows that no longer describe anything. The backend now
+    records that failure instead of raising it, so what a commit failure means
+    is once again "the write did not land" and these paths' messages are true.
+    """
+
+    @pytest.mark.asyncio
+    async def test_merge_retires_rows_when_the_notification_fails(
+        self, rag, monkeypatch
+    ):
+        # after=1: the first commit publishes the merged target, the second one
+        # the source removal. Only the second leaves rows owed.
+        rag.fail_publication(monkeypatch, after=1)
+
+        await rag.merge()
+
+        assert SOURCE not in rag.persisted_graph().nodes()
+        assert SOURCE not in rag.entity_chunks.records
+        assert _rows_without_live_objects(rag) == []
+        assert _live_objects_without_rows(rag) == []
+
+    @pytest.mark.asyncio
+    async def test_rename_retires_rows_when_the_notification_fails(
+        self, rag, monkeypatch
+    ):
+        rag.fail_publication(monkeypatch)
+
+        await rag.rename()
+
+        assert SOURCE not in rag.persisted_graph().nodes()
+        assert SOURCE not in rag.entity_chunks.records
+        assert rag.entity_chunks.records[RENAMED] == CHUNKS
+        assert _rows_without_live_objects(rag) == []
+        assert _live_objects_without_rows(rag) == []

@@ -26,6 +26,7 @@ verified by hand while writing them:
 """
 
 import asyncio
+import logging
 import threading
 import time
 
@@ -386,3 +387,46 @@ def test_gate_is_rebound_after_the_owning_loop_closes(tmp_path):
         asyncio.run(second_loop())
     finally:
         finalize_share_data()
+
+
+async def test_a_failed_notification_is_not_reported_as_a_failed_write(
+    tmp_path, monkeypatch, caplog
+):
+    """A publication failure must not be raised as a save failure.
+
+    ``on_committed`` runs only after the write succeeded, so an exception out of
+    ``set_all_update_flags`` means the GraphML file is already on disk. Letting
+    it propagate reported a durable mutation as a lost one, and every commit
+    caller inherited that: ``utils_graph``'s deletion paths skipped the chunk
+    tracking retirement they still owed -- leaving a vanished object's
+    authoritative rows behind -- and ``_insert_done`` marked a document FAILED
+    whose graph writes were on disk.
+
+    What actually failed is the cross-process reload notification, so other
+    workers keep serving the previous snapshot until the next commit flips their
+    flags. That is a visibility lag, and it belongs in the log, not in a raise.
+    """
+    storage = await _make_storage(tmp_path)
+    await storage.upsert_node("A", {"entity_id": "A"})
+
+    async def failing_set_all_update_flags(namespace, workspace=None):
+        raise RuntimeError("shared-storage manager is down")
+
+    monkeypatch.setattr(
+        "lightrag.kg.networkx_impl.set_all_update_flags",
+        failing_set_all_update_flags,
+    )
+
+    # lightrag's logger does not propagate, so caplog cannot see it otherwise.
+    logger = logging.getLogger("lightrag")
+    monkeypatch.setattr(logger, "propagate", True)
+
+    with caplog.at_level(logging.ERROR, logger="lightrag"):
+        committed = await storage.index_done_callback()
+
+    assert committed is True
+    persisted = NetworkXStorage.load_nx_graph(storage._graphml_xml_file)
+    assert persisted is not None and persisted.has_node("A")
+    assert any(
+        "could not be notified" in record.getMessage() for record in caplog.records
+    ), f"the notification failure was not logged: {caplog.text}"
