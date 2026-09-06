@@ -92,6 +92,8 @@ class _VectorStorage:
     def __init__(self, global_config):
         self.global_config = global_config
         self.fail = False
+        self.fail_flush = False
+        self.flushes = 0
 
     def _check(self):
         if self.fail:
@@ -107,7 +109,9 @@ class _VectorStorage:
         self._check()
 
     async def index_done_callback(self):
-        return None
+        self.flushes += 1
+        if self.fail_flush:
+            raise _Boom("vector flush failed")
 
 
 class _Fixture:
@@ -141,7 +145,12 @@ class _Fixture:
         )
         await self.entity_chunks.upsert({ENTITY: dict(CHUNKS), OTHER: dict(CHUNKS)})
         await self.relation_chunks.upsert({RELATION_KEY: dict(CHUNKS)})
+        # Commit the baseline: the persisted graph is what a restart reads back.
+        await self.graph.index_done_callback()
         return self
+
+    def persisted_graph(self):
+        return NetworkXStorage.load_nx_graph(self.graph._graphml_xml_file)
 
     async def delete_entity(self):
         return await utils_graph.adelete_by_entity(
@@ -313,7 +322,7 @@ def _log_graph_commit(fixture, monkeypatch, *, fail: bool):
     original = fixture.graph.index_done_callback
 
     async def _commit():
-        fixture.commit_log.append("graph")
+        getattr(fixture, "commit_log", []).append("graph")
         if fail:
             raise _Boom("graph commit failed")
         return await original()
@@ -367,4 +376,78 @@ class TestDurableCommitOrdering:
         assert deferred.commit_log[0] == "graph"
         assert set(deferred.commit_log[1:]) == {"entity_chunks", "relation_chunks"}
         assert ENTITY not in deferred.entity_chunks.disk
+        assert RELATION_KEY not in deferred.relation_chunks.disk
+
+
+class TestMixedBackendDurability:
+    """Neither the calls nor the flushes can be ordered in isolation.
+
+    Storage families differ in *when* a mutation becomes durable, so these cases
+    mix them the way a real deployment can: a deferred graph (NetworkX) with an
+    immediate-write tracking store (Redis/PG), and a deferred graph whose commit
+    succeeds while a vector flush fails.
+    """
+
+    @pytest.mark.asyncio
+    async def test_immediate_kv_rows_survive_a_failed_graph_commit(
+        self, rag, monkeypatch
+    ):
+        # `rag` deliberately pairs the real deferred graph with immediate-write
+        # KV doubles: the tracking delete is durable the moment it is called, so
+        # it must not happen until the graph commit has succeeded.
+        rag.commit_log = []
+        _log_graph_commit(rag, monkeypatch, fail=True)
+
+        result = await rag.delete_entity()
+
+        assert result.status == "fail"
+        # The GraphML commit failed, so a restart reloads a live entity -- with
+        # its authoritative provenance still next to it. In-memory state is not
+        # the question here; only what survived to disk is.
+        assert rag.persisted_graph().has_node(ENTITY)
+        assert rag.entity_chunks.records[ENTITY] == CHUNKS
+        assert rag.relation_chunks.records[RELATION_KEY] == CHUNKS
+
+    @pytest.mark.asyncio
+    async def test_immediate_kv_relation_row_survives_a_failed_graph_commit(
+        self, rag, monkeypatch
+    ):
+        rag.commit_log = []
+        _log_graph_commit(rag, monkeypatch, fail=True)
+
+        result = await rag.delete_relation()
+
+        assert result.status == "fail"
+        assert rag.persisted_graph().has_edge(ENTITY, OTHER)
+        assert rag.relation_chunks.records[RELATION_KEY] == CHUNKS
+
+    @pytest.mark.asyncio
+    async def test_vector_flush_failure_still_clears_tracking(self, deferred):
+        # Only the vector flush fails. Bundling it with the graph commit in one
+        # gather makes the durable outcome unspecified: the exception propagates
+        # while the graph's own commit is still a pending background task, so
+        # whether the node's removal ever lands is a matter of scheduling -- and
+        # if it does, the tracking callbacks have already been skipped, the rows
+        # come back on restart, and a reinsert inherits the old chunk ids (the
+        # incident relation rows are not even reachable by the not_found sweep).
+        # Committing the graph in its own phase makes both halves definite.
+        deferred.entities_vdb.fail_flush = True
+
+        result = await deferred.delete_entity()
+
+        assert result.status == "fail"
+        assert not deferred.persisted_graph().has_node(ENTITY)
+        assert ENTITY not in deferred.entity_chunks.disk
+        assert RELATION_KEY not in deferred.relation_chunks.disk
+        # The unrelated entity keeps its provenance through the failure.
+        assert deferred.entity_chunks.disk[OTHER] == CHUNKS
+
+    @pytest.mark.asyncio
+    async def test_relation_vector_flush_failure_still_clears_tracking(self, deferred):
+        deferred.relationships_vdb.fail_flush = True
+
+        result = await deferred.delete_relation()
+
+        assert result.status == "fail"
+        assert not deferred.persisted_graph().has_edge(ENTITY, OTHER)
         assert RELATION_KEY not in deferred.relation_chunks.disk
