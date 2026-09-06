@@ -1694,6 +1694,8 @@ async def acreate_entity(
     Replaces entity chunk tracking with the distinct real source IDs supplied
     for this creation, or an explicit empty row when there are none. Historical
     no-source placeholders do not count as evidence.
+    Manual creation does not protect the entity or its description from deletion:
+    once documents mention it, purging its last real source may delete it entirely.
 
     Args:
         chunk_entity_relation_graph: Graph storage instance
@@ -1863,6 +1865,8 @@ async def acreate_relation(
     Replaces relation chunk tracking with the distinct real source IDs supplied
     for this creation, or an explicit empty row when there are none. Orphan rows
     from a previous relation are never inherited.
+    Manual creation does not protect the relation or its description from deletion:
+    once documents mention it, purging its last real source may delete it entirely.
 
     Args:
         chunk_entity_relation_graph: Graph storage instance

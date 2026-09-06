@@ -210,9 +210,18 @@ class _StorageMigrationMixin:
         migration lock and propagate failures before any creation write. This
         checks only chunk tracking, not document-anchor migrations, and leaves
         existing non-empty namespaces (including authoritative empty rows) alone.
+        A successful check is cached per instance, including when a namespace
+        stays empty. Failed checks remain retryable; each worker checks once.
         """
+        if self._chunk_tracking_migration_checked:
+            return
         async with get_data_init_lock():
+            # Another creation on this instance may have completed the check
+            # while this caller waited for the shared initialization lock.
+            if self._chunk_tracking_migration_checked:
+                return
             await self._migrate_chunk_tracking_storage()
+            self._chunk_tracking_migration_checked = True
 
     async def _migrate_chunk_tracking_storage(self) -> None:
         """Ensure entity/relation chunk tracking KV stores exist and are seeded."""

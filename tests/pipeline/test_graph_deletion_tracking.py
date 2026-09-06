@@ -410,3 +410,72 @@ async def test_invalid_sdk_creation_does_not_start_migration(
             )
     assert await rag.entity_chunks.is_empty()
     assert await rag.relation_chunks.is_empty()
+
+
+@pytest.mark.asyncio
+async def test_creation_skips_migration_lock_after_success(creation_rag, monkeypatch):
+    rag = creation_rag
+    await rag.acreate_entity("First", {"description": "first"})
+    # No relations were created: is_empty() cannot prove this namespace has
+    # already been checked, even though another full graph scan is unnecessary.
+    assert await rag.relation_chunks.is_empty()
+
+    def unexpected_lock():
+        raise AssertionError("A successful migration check must bypass the lock")
+
+    monkeypatch.setattr(
+        "lightrag.storage_migrations.get_data_init_lock", unexpected_lock
+    )
+    await rag.acreate_entity("Second", {"description": "second"})
+    await rag.acreate_relation("First", "Second", {"description": "manual"})
+    assert await rag.chunk_entity_relation_graph.has_edge("First", "Second")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_creation_migration_checks_run_once(creation_rag, monkeypatch):
+    import asyncio
+    from contextlib import asynccontextmanager
+    from lightrag import storage_migrations
+
+    rag = creation_rag
+    original_lock = storage_migrations.get_data_init_lock
+    first_migrating = asyncio.Event()
+    second_waiting = asyncio.Event()
+    finish_migration = asyncio.Event()
+    acquisitions = 0
+    migrations = 0
+
+    @asynccontextmanager
+    async def observed_lock():
+        nonlocal acquisitions
+        acquisitions += 1
+        if acquisitions == 2:
+            second_waiting.set()
+        async with original_lock():
+            yield
+
+    async def blocked_migration():
+        nonlocal migrations
+        migrations += 1
+        first_migrating.set()
+        await finish_migration.wait()
+
+    monkeypatch.setattr(storage_migrations, "get_data_init_lock", observed_lock)
+    monkeypatch.setattr(rag, "_migrate_chunk_tracking_storage", blocked_migration)
+    first = asyncio.create_task(rag._migrate_chunk_tracking_before_creation())
+    second = None
+    try:
+        await asyncio.wait_for(first_migrating.wait(), timeout=5)
+        second = asyncio.create_task(rag._migrate_chunk_tracking_before_creation())
+        await asyncio.wait_for(second_waiting.wait(), timeout=5)
+        finish_migration.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+        assert migrations == 1
+    finally:
+        for task in (first, second):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (first, second) if task is not None),
+            return_exceptions=True,
+        )

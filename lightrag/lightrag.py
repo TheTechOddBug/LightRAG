@@ -1557,6 +1557,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
         self._llm_role_builder = None
         self._retired_llm_queue_cleanup_tasks: set[asyncio.Task] = set()
+        self._chunk_tracking_migration_checked = False
 
         # The event loop this instance's storages bind to (set in
         # initialize_storages). Kept off the dataclass fields so asdict() in
