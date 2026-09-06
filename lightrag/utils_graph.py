@@ -52,13 +52,6 @@ _RELATION_DATA_FIELDS: dict[str, str] = {
     "weight": _NUMBER_FIELD,
 }
 
-_ENTITY_DELETE_JOURNAL_PREFIX = "entity-delete-journal-"
-
-
-def _entity_delete_journal_key(entity_name: str) -> str:
-    """Return the reserved relation-tracking key for an entity deletion WAL."""
-    return compute_mdhash_id(entity_name, prefix=_ENTITY_DELETE_JOURNAL_PREFIX)
-
 
 def _sanitize_graph_fields(
     data: dict[str, Any],
@@ -434,11 +427,8 @@ async def adelete_by_entity(
     (see :func:`_commit_graph_or_raise`), (2) only then delete and commit the tracking
     rows, (3) flush the vector storages last, so a vector failure cannot abort a
     deletion whose node is already durably gone and strand rows the sweep cannot
-    reach. Before phase 1, entity deletion durably journals its incident relation
-    keys in the relation-tracking store; a retry can therefore finish phase 2
-    after a restart, when the deleted graph node can no longer reveal those keys.
-    A stale vector record is the recoverable, rebuildable residue this codebase
-    already accepts elsewhere.
+    reach. A stale vector record is the recoverable, rebuildable residue this
+    codebase already accepts elsewhere.
 
     Args:
         chunk_entity_relation_graph: Graph storage instance
@@ -472,24 +462,6 @@ async def adelete_by_entity(
                 await _sweep_orphan_tracking_row(
                     entity_chunks_storage, entity_name, f"entity `{entity_name}`"
                 )
-                journal_key = _entity_delete_journal_key(entity_name)
-                journal = (
-                    await relation_chunks_storage.get_by_id(journal_key)
-                    if relation_chunks_storage is not None
-                    else None
-                )
-                if journal is not None:
-                    relation_keys = journal.get("chunk_ids", [])
-                    if relation_keys:
-                        await relation_chunks_storage.delete(relation_keys)
-                    # Retire the WAL only after the cleanup it describes has
-                    # returned successfully. Backends need not preserve the
-                    # order of IDs within one bulk delete.
-                    await relation_chunks_storage.delete([journal_key])
-                    logger.info(
-                        "Entity Delete: replayed chunk-tracking cleanup for "
-                        f"{len(relation_keys)} relations"
-                    )
                 # Flush whether or not a row was visible. A deferred backend
                 # whose commit failed during an earlier attempt still holds that
                 # delete in memory while the stale row sits on disk, so keying
@@ -529,26 +501,6 @@ async def adelete_by_entity(
             await entities_vdb.delete_entity(entity_name)
             await relationships_vdb.delete_entity_relation(entity_name)
 
-            # Persist the incident keys before removing the graph node. Once
-            # that commit lands, a restart cannot reconstruct its edges, so a
-            # tracking callback failure would otherwise make their stale rows
-            # unreachable. This reserved relation-tracking row is a small WAL:
-            # it carries only relation keys, never replaces live provenance,
-            # and is removed in the same commit as those rows.
-            journal_key = _entity_delete_journal_key(entity_name)
-            if relation_chunks_storage is not None and relation_keys_to_delete:
-                await relation_chunks_storage.upsert(
-                    {
-                        journal_key: {
-                            "chunk_ids": relation_keys_to_delete,
-                            "count": len(relation_keys_to_delete),
-                        }
-                    }
-                )
-                await _persist_graph_updates(
-                    relation_chunks_storage=relation_chunks_storage
-                )
-
             # PHASE 2 — the node is gone for good; drop its tracking rows.
             # Relation rows first: an entity row left behind is reachable by the
             # not_found sweep, while an orphaned relation row is not once the
@@ -566,19 +518,20 @@ async def adelete_by_entity(
                         chunk_entity_relation_graph, f"Entity Delete: '{entity_name}'"
                     )
                 except asyncio.CancelledError as exc:
-                    # File-backed commits defer cancellation until the write and
-                    # its notification hook have landed, then raise it from this
-                    # await. The graph is already gone at that point, so finish
-                    # the tracking half before restoring cancellation.
+                    # Belt and braces for a cancellation raised INSIDE this
+                    # region. The caller's own cancellation does not arrive here
+                    # -- that is the point of running this as its own task -- so
+                    # on the file-backed path `commit_in_storage_io` finishes the
+                    # write and its notification hook and returns normally, and
+                    # the deferred cancel is re-raised to the caller afterwards.
+                    # This branch covers a direct cancellation of this task: the
+                    # graph may already be durably gone, so the tracking half
+                    # still has to run before cancellation is restored.
                     commit_cancel = exc
 
                 if relation_keys_to_delete:
                     try:
                         await relation_chunks_storage.delete(relation_keys_to_delete)
-                        # Keep the WAL until every addressed row is gone; a
-                        # retry can safely repeat the deletes if retiring the
-                        # journal itself fails.
-                        await relation_chunks_storage.delete([journal_key])
                     except Exception:
                         logger.error(
                             "Entity Delete: failed to remove relation chunk tracking; "
@@ -731,6 +684,7 @@ async def adelete_by_relation(
                         f"Relation Delete: `{source_entity}`~`{target_entity}`",
                     )
                 except asyncio.CancelledError as exc:
+                    # Same belt-and-braces as the entity path -- see there.
                     commit_cancel = exc
 
                 if relation_chunks_storage is not None:

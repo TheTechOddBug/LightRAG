@@ -1511,11 +1511,16 @@ The graph object's removal is committed first, on its own; only then are the
 tracking rows deleted and committed; the vector storages are flushed last. This
 holds for any mix of backends, including a deferred graph with an immediate-write
 tracking store, which is why the staging is by *durability* rather than by call
-order. Before removing an entity node, LightRAG also commits a reserved cleanup
-journal containing its incident relation keys. The journal is retired only after
-those tracking rows are deleted; if their commit fails and the process restarts, the `not_found`
-retry replays the journal even though the deleted node can no longer reveal its
-edges.
+order.
+
+Removing the object and cleaning up its rows is additionally one region a
+cancellation cannot cut in half. It has to begin at the graph mutation: a cancel
+before the commit leaves the removal in the in-memory graph with the backend
+marked dirty, so the pipeline's next commit publishes it while the cleanup never
+runs, and a cancel *during* the commit is deferred by the storage-IO layer until
+the write and its notification hook have landed. Cancelling a deletion therefore
+waits for the object's removal and its tracking cleanup to finish; only the
+vector flush is skipped.
 
 Every remaining failure state is therefore recoverable, and repeating the
 deletion is always the recovery step:
@@ -1524,8 +1529,8 @@ deletion is always the recovery step:
 | --- | --- | --- |
 | Graph commit | Entity live, rows live | Consistent; retry the deletion |
 | Tracking delete or commit | Entity gone, its row stale | Retry: a deletion reporting `not_found` sweeps a stale row for that name and flushes pending tracking state whether or not a row is still visible in memory |
-| Entity relation-tracking delete or commit | Entity gone, incident relation rows stale | Retry: the durable cleanup journal preserves the relation keys across restart, and the `not_found` path deletes those rows and the journal together |
-| Cancellation during the graph commit | Commit outcome may already be durable | The graph commit and tracking cleanup run in one cancellation-deferring region; cancellation is re-raised only after any owed cleanup finishes |
+| A failing tracking delete leaves incident relation rows of an entity deletion | Entity gone, relation rows stale | Not reachable automatically — the node is gone, so its edges are unknowable. Logged with the exact storage keys; delete the relation directly to sweep its row |
+| Process exit between the graph commit and the tracking commit, on a **deferred** tracking backend (JSON) | Entity gone, its rows and its relations' rows stale | The entity's own row is swept by a repeated deletion; its incident relation rows are not, and their keys are not logged because nothing failed. Delete the relations directly, or rebuild tracking. Not closed by this staging — an immediate-write tracking store (Redis/PG/Mongo) is not exposed to it |
 | Vector flush | Entity and rows gone, vector record stale | The rebuildable window this codebase accepts elsewhere; `lightrag-rebuild-vdb` restores it |
 
 ### Delete Relations
