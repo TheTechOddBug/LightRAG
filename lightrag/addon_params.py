@@ -157,7 +157,11 @@ class ObservableAddonParams(dict[str, Any]):
     def update(self, *args: Any, **kwargs: Any) -> None:
         if not args and not kwargs:
             return
-        super().update(*args, **kwargs)
+        # Materialize first because dict.update() can apply valid iterable
+        # entries before a later malformed entry raises. Live configuration and
+        # its derived cache must change together or not at all.
+        pending = dict(*args, **kwargs)
+        super().update(pending)
         self._changed()
 
     def __ior__(self, other: Mapping[str, Any]):
