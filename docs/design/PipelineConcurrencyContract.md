@@ -4,7 +4,7 @@ Read this before changing `lightrag/pipeline.py`, `lightrag/kg/pipeline_ingress.
 
 The document ingestion pipeline coordinates concurrent writers through `pipeline_status` (a per-workspace shared dict in `lightrag.kg.shared_storage`). These fields are mutated under `get_namespace_lock("pipeline_status", workspace=...)`:
 
-- **`busy`**: the workspace writer slot. Set by the processing loop, destructive jobs (clear / per-doc delete), custom-chunk insertion, and public SDK graph mutations. On its own, `busy=True` does NOT block enqueue — see `destructive_busy` for the exclusive subset. Short SDK graph mutations hand committed ingress work to the processing loop before releasing this slot.
+- **`busy`**: any pipeline-busy state. Set by both the processing loop AND destructive jobs (clear / per-doc delete). On its own, `busy=True` does NOT block enqueue — see `destructive_busy` for the exclusive subset.
 - **`destructive_busy`**: the busy job is `/documents/clear` or `/documents/{doc_id}` (delete). These DROP storages and remove input files; a concurrent enqueue accepted in this window would write to storage being torn down and silently lose the document. Reservation and the enqueue last-line guard reject when this is True.
 - **`scanning`**: a `/documents/scan` task is running (whole lifecycle: classification + processing). Used by the `/scan` endpoint to refuse overlapping scans. Does NOT on its own block uploads/inserts.
 - **`scanning_exclusive`**: True only during the scan task's classification phase, when `run_scanning_process` is reading `doc_status` to classify files (PROCESSED → archive, FAILED-without-`full_docs` → retry-as-new, etc.) and possibly deleting stale stubs. Reservation and the enqueue last-line guard reject when this is set. Cleared before the scan transitions to its processing phase, allowing concurrent uploads to land while scan-driven processing finishes.
@@ -24,7 +24,6 @@ Mutual-exclusion rules (all checked atomically inside the lock):
 | Scan endpoint reservation | `busy or scanning or pending_enqueues > 0` | `scanning = True` |
 | `apipeline_process_enqueue_documents` entry | (already busy → arm ingress auto-rescan, return) | `busy = True` (NOT `destructive_busy`) |
 | `clear_documents` / `delete_document` (synchronous reservation) | `busy or scanning or pending_enqueues > 0` | `busy = True`, `destructive_busy = True` |
-| `_graph_mutation_slot` (`insert_custom_kg`; entity/relation create, edit, delete, merge) | `busy` or recovery fence | `busy = True`, with ingress handoff on exit |
 
 The contract permits **concurrent enqueue + processing**: a freshly-uploaded doc lands in `doc_status` while the loop is mid-batch, its document message is routed into the running batch by the in-batch feeder (or resolved at the batch boundary by the quiescence decision), and the doc processes without waiting for a new run.
 
