@@ -366,3 +366,50 @@ class TestUpsertStillPrecedesDelete:
         assert rag.entity_chunks.records[RENAMED] == CHUNKS
         assert rag.relation_chunks.records[make_relation_chunk_key(RENAMED, OTHER)]
         assert rag.entity_chunks.records[SOURCE] == CHUNKS
+
+
+class TestMergingEntitiesWithoutRelations:
+    """Merging entities that carry no edges must not fail after the commit.
+
+    `stale_relation_keys` is read unconditionally when the source removal is
+    made durable, but it was only assigned inside the branch guarded by
+    `all_relations`. Entities with no incident edges leave that list empty, so
+    the read raised `UnboundLocalError` -- after the commit that had already
+    removed the source entities. The merge had landed and the API reported it as
+    a failure.
+    """
+
+    ISOLATED_SOURCE = "DERELICT"
+    ISOLATED_TARGET = "SALVAGE"
+
+    @pytest.mark.asyncio
+    async def test_merge_of_edgeless_entities_succeeds(self, rag):
+        for name in (self.ISOLATED_SOURCE, self.ISOLATED_TARGET):
+            await rag.graph.upsert_node(
+                name, {"entity_id": name, "description": "d", "source_id": "chunk-1"}
+            )
+        await rag.entity_chunks.upsert(
+            {
+                name: dict(CHUNKS)
+                for name in (self.ISOLATED_SOURCE, self.ISOLATED_TARGET)
+            }
+        )
+        await rag.graph.index_done_callback()
+
+        await utils_graph.amerge_entities(
+            rag.graph,
+            rag.entities_vdb,
+            rag.relationships_vdb,
+            [self.ISOLATED_SOURCE],
+            self.ISOLATED_TARGET,
+            None,
+            None,
+            rag.entity_chunks,
+            rag.relation_chunks,
+        )
+
+        persisted = rag.persisted_graph()
+        assert self.ISOLATED_SOURCE not in persisted.nodes()
+        assert self.ISOLATED_TARGET in persisted.nodes()
+        assert self.ISOLATED_SOURCE not in rag.entity_chunks.records
+        assert _live_objects_without_rows(rag) == []

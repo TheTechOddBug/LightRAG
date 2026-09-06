@@ -2188,6 +2188,14 @@ async def _merge_entities_impl(
     # new (relations already attached to an existing target keep their key),
     # so only keys outside the new key set are deleted; deleting them after
     # the upsert would drop the rows just written.
+    #
+    # Bound before the guard, not inside it: step 10b reads this list
+    # unconditionally, and merging entities that carry no incident edges
+    # leaves `all_relations` empty. Assigning only in the branch below made
+    # that case raise UnboundLocalError AFTER the graph commit had already
+    # removed the source entities -- reporting failure for a merge that had
+    # in fact landed.
+    stale_relation_keys: list[str] = []
     if relation_chunks_storage is not None and all_relations:
         if relation_chunk_tracking:
             updates = {}
