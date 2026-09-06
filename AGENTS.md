@@ -74,6 +74,7 @@ Each `LightRAG` instance can pass a `workspace` parameter for data isolation. Im
 - **`kg_write_state` must never be inferred or backfilled** — it is written once at enqueue and is monotonic. A backfill reproduces issue #3400.
 - `kg_write_state` and `kg_purge` must stay in both `_DOC_STATUS_METADATA_CARRY_OVER_KEYS` and `_DOC_STATUS_METADATA_DIRECTIVE_KEYS` (`lightrag/utils_pipeline.py`); dropping either turns a resumable purge into a permanent refusal.
 - Chunk tracking (`entity_chunks` / `relation_chunks`) outranks graph `source_id`; code folding a `source_id` delta back into tracking must append genuine additions only.
+- Merge and rename have **no transaction** across the graph, the tracking KV and the vector store, so every ordering leaves an intermediate state. [The failure model](docs/design/PurgeRecoveryContract.md#merge-and-rename-failure-model) lists the ordering invariants, the residues that are accepted (self-healing or harmless in direction) and the remedies already rejected — read it before reordering `_merge_entities_impl` or the rename branch of `_edit_entity_impl`, and judge a proposed change by whether it improves on an accepted residue rather than by whether an inconsistent state exists.
 
 ### Relation weight contract
 
