@@ -51,6 +51,7 @@ LightRAG uses 4 storage types with pluggable backends:
 
 Each `LightRAG` instance can pass a `workspace` parameter for data isolation. Implementation differs per storage type:
 - **File-based**: subdirectories under `working_dir`.
+- **NetworkX destructive status**: `NetworkXStorage.drop()` reports the durable GraphML deletion. A later peer reload-notification failure is logged as partial propagation and must not turn that completed deletion into an error response; `/documents/clear` uses the status to decide whether input files are safe to delete.
 - **Collection-based**: collection name prefixes.
 - **Relational DB**: workspace column filtering.
 - **Qdrant**: payload-based partitioning.
