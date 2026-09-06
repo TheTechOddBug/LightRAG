@@ -824,8 +824,13 @@ async def _edit_entity_impl(
                         (renamed_source, renamed_target, edge_data)
                     )
 
-        await chunk_entity_relation_graph.delete_node(entity_name)
-
+        # The old node is removed inside the cancellation-deferring region
+        # below, not here. On an immediate-write graph backend (Neo4j, Memgraph,
+        # MongoDB, PostgreSQL -- their graph `index_done_callback` is a no-op)
+        # `delete_node` is durable the moment it returns, so removing it at this
+        # point would leave every await between here and the retirement able to
+        # exit with the old node gone and its tracking rows still on disk.
+        # adelete_by_entity stages its own `delete_node` the same way.
         old_entity_id = compute_mdhash_id(entity_name, prefix="ent-")
         await entities_vdb.delete([old_entity_id])
 
@@ -1058,6 +1063,11 @@ async def _edit_entity_impl(
     # under neither key. An orphaned new-key row is dead bookkeeping a retry
     # overwrites; a live object with no row is the bug.
     async def _commit_rename_and_retire_tracking() -> None:
+        # `entity_name` has been rebound to the new name by now, so the removal
+        # names the original explicitly.
+        if is_renaming:
+            await chunk_entity_relation_graph.delete_node(original_entity_name)
+
         await _commit_graph_or_raise(
             chunk_entity_relation_graph, f"Entity Edit: `{original_entity_name}`"
         )
@@ -2411,6 +2421,14 @@ async def _merge_entities_impl(
             "server and run the offline rebuild tool (lightrag-rebuild-vdb) to restore consistency."
         ) from e
 
+    # The sources that step 10 actually removes, and whose tracking rows step
+    # 10b retires once that removal is durable -- never before it: a row retired
+    # ahead of the object it describes is the state the purge recovery contract
+    # forbids. Bound here, ahead of every consumer, so the retirement never
+    # depends on a branch having run -- the shape of the `stale_relation_keys`
+    # defect.
+    entities_to_remove = [e for e in source_entities if e != target_entity]
+
     # 9. Merge entity chunk tracking (source entities first, then target entity)
     if entity_chunks_storage is not None:
         from .utils import has_chunk_tracking_row
@@ -2495,27 +2513,22 @@ async def _merge_entities_impl(
                 f"Entity Merge: find {len(merged_chunk_ids)} chunks related to '{target_entity}'"
             )
 
-        # Deleted in step 10b, not here: these entities are still on disk until
-        # the commit that follows their removal, and a row retired ahead of the
-        # object it describes is the state the purge recovery contract forbids.
-        entity_keys_to_delete = [e for e in source_entities if e != target_entity]
+    # 10. Delete the source entities' vector records, BEFORE the node removals
+    # below. Same order, and same reason, as adelete_by_entity: on an
+    # immediate-write graph backend (Neo4j, Memgraph, MongoDB, PostgreSQL --
+    # their graph `index_done_callback` is a no-op) `delete_node` is durable the
+    # moment it returns, so a vector failure after it would exit with the source
+    # already gone and its tracking rows unretired. Doing the vector work first
+    # leaves the inverse residue -- a live node whose vector record is missing --
+    # which is the rebuildable window this codebase already accepts.
+    if target_entity in source_entities:
+        logger.warning(
+            f"Entity Merge: source entity'{target_entity}' is same as target entity"
+        )
 
-    # 10. Delete source entities
-    for entity_name in source_entities:
-        if entity_name == target_entity:
-            logger.warning(
-                f"Entity Merge: source entity'{entity_name}' is same as target entity"
-            )
-            continue
+    for entity_name in entities_to_remove:
+        logger.info(f"Entity Merge: deleting '{entity_name}' from vdb")
 
-        logger.info(f"Entity Merge: deleting '{entity_name}' from KG and vdb")
-
-        # Delete entity node and related edges from knowledge graph
-        await chunk_entity_relation_graph.delete_node(entity_name)
-
-        # Delete entity record from vector database. The graph node is already
-        # gone, so on failure the message must NOT claim the source entity still
-        # exists — only that a stale vector record may remain.
         entity_id = compute_mdhash_id(entity_name, prefix="ent-")
         try:
             await safe_vdb_operation_with_exception(
@@ -2529,11 +2542,9 @@ async def _merge_entities_impl(
             raise VectorStorageConsistencyError(
                 f"Vector storage delete of merged-away source entity '{entity_name}' "
                 f"failed while finalizing the merge into '{target_entity}': {e}. "
-                "The source entity was already removed from the knowledge graph (the "
-                "authoritative source); only a stale vector record may remain, so no "
-                "data is lost. Stop the LightRAG server and run the offline rebuild "
-                "tool (lightrag-rebuild-vdb) to clear the stale record and restore "
-                "consistency."
+                "The source entities were NOT removed from the knowledge graph (the "
+                "authoritative source) and still carry their chunk tracking, so no "
+                "data is lost and nothing has lost its provenance. Retry the merge."
             ) from e
 
     # 10b. Make the source entities' removal durable, and only then retire the
@@ -2550,6 +2561,15 @@ async def _merge_entities_impl(
     # bug. Both invariants hold with the upserts before the commit and the
     # deletes after it.
     async def _commit_source_removal_and_retire_tracking() -> None:
+        # The node removals belong INSIDE the region, not before it: on an
+        # immediate-write graph backend they are durable as they run, so a
+        # cancellation between them and the commit would strand the tracking
+        # rows of objects that are already gone. adelete_by_entity stages its
+        # own `delete_node` the same way.
+        for entity_name in entities_to_remove:
+            logger.info(f"Entity Merge: deleting '{entity_name}' from KG")
+            await chunk_entity_relation_graph.delete_node(entity_name)
+
         try:
             await _commit_graph_or_raise(
                 chunk_entity_relation_graph,
@@ -2573,13 +2593,13 @@ async def _merge_entities_impl(
                     f"these rows are now orphaned: {stale_relation_keys}"
                 )
                 raise
-        if entity_chunks_storage is not None and entity_keys_to_delete:
+        if entity_chunks_storage is not None and entities_to_remove:
             try:
-                await entity_chunks_storage.delete(entity_keys_to_delete)
+                await entity_chunks_storage.delete(entities_to_remove)
             except Exception:
                 logger.error(
                     "Entity Merge: failed to retire entity chunk tracking; "
-                    f"these rows are now orphaned: {entity_keys_to_delete}"
+                    f"these rows are now orphaned: {entities_to_remove}"
                 )
                 raise
 

@@ -95,12 +95,17 @@ class _KVStorage:
 class _VectorStorage:
     def __init__(self, global_config):
         self.global_config = global_config
+        self.delete_error: BaseException | None = None
 
     async def upsert(self, data):
         pass
 
     async def delete(self, ids):
-        pass
+        # A real vector store round-trips here; the yield makes this a genuine
+        # await between the graph work around it.
+        await asyncio.sleep(0)
+        if self.delete_error is not None:
+            raise self.delete_error
 
     async def delete_entity(self, entity_name):
         pass
@@ -112,21 +117,60 @@ class _VectorStorage:
         await asyncio.sleep(0)
 
 
+class _ImmediateWriteGraph:
+    """Neo4j / Memgraph / MongoDB / PostgreSQL semantics for the graph store.
+
+    Those backends persist each mutation as it runs and their graph
+    `index_done_callback` is a no-op returning None (which
+    `_commit_graph_or_raise` accepts: only an explicit False means "declined").
+    So the commit carries no information there, and what decides whether an
+    object is still on disk is when the mutation itself ran -- which is why the
+    node removal has to be inside the cancellation-deferring region, not before
+    it. NetworkX cannot show this: its deletes stay in memory until the commit.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def _write_through(self, coro):
+        result = await coro
+        await self._inner.index_done_callback()
+        return result
+
+    async def upsert_node(self, node_id, node_data):
+        return await self._write_through(self._inner.upsert_node(node_id, node_data))
+
+    async def upsert_edge(self, source_node_id, target_node_id, edge_data):
+        return await self._write_through(
+            self._inner.upsert_edge(source_node_id, target_node_id, edge_data)
+        )
+
+    async def delete_node(self, node_id):
+        return await self._write_through(self._inner.delete_node(node_id))
+
+    async def index_done_callback(self):
+        return None
+
+
 class _Fixture:
     """A real NetworkXStorage, so "still on disk" is observed, not simulated."""
 
-    def __init__(self, tmp_path):
+    def __init__(self, tmp_path, *, immediate: bool = False):
         self.global_config = {
             "working_dir": str(tmp_path),
             "workspace": "",
             "embedding_batch_num": 10,
         }
-        self.graph = NetworkXStorage(
+        graph = NetworkXStorage(
             namespace="chunk_entity_relation",
             workspace="",
             global_config=self.global_config,
             embedding_func=None,
         )
+        self.graph = _ImmediateWriteGraph(graph) if immediate else graph
         self.entities_vdb = _VectorStorage(self.global_config)
         self.relationships_vdb = _VectorStorage(self.global_config)
         self.entity_chunks = _KVStorage("entity_chunks")
@@ -243,6 +287,14 @@ async def rag(tmp_path):
     await fixture.graph.finalize()
 
 
+@pytest.fixture
+async def immediate_rag(tmp_path):
+    """The same fixture on a backend that persists every mutation inline."""
+    fixture = await _Fixture(tmp_path, immediate=True).start()
+    yield fixture
+    await fixture.graph.finalize()
+
+
 def _live_objects_without_rows(fixture):
     """Every on-disk node/edge whose authoritative tracking row is missing."""
     persisted = fixture.persisted_graph()
@@ -252,6 +304,22 @@ def _live_objects_without_rows(fixture):
         for edge in persisted.edges()
         if make_relation_chunk_key(*sorted(edge)) not in fixture.relation_chunks.records
     ]
+    return orphans
+
+
+def _rows_without_live_objects(fixture):
+    """Every tracking row whose graph object is no longer on disk.
+
+    The inverse of the check above, and the residue this file's staging trades
+    against: an orphan row is dead bookkeeping until its key recurs, at which
+    point extraction reads it back as authoritative provenance.
+    """
+    persisted = fixture.persisted_graph()
+    live_edge_keys = {
+        make_relation_chunk_key(*sorted(edge)) for edge in persisted.edges()
+    }
+    orphans = [n for n in fixture.entity_chunks.records if n not in persisted.nodes()]
+    orphans += [k for k in fixture.relation_chunks.records if k not in live_edge_keys]
     return orphans
 
 
@@ -487,3 +555,67 @@ class TestMergingEntitiesWithoutRelations:
         assert self.ISOLATED_TARGET in persisted.nodes()
         assert self.ISOLATED_SOURCE not in rag.entity_chunks.records
         assert _live_objects_without_rows(rag) == []
+
+
+class TestImmediateWriteBackendsRemoveTheNodeInsideTheRegion:
+    """On an inline-persisting graph store the removal must not precede the region.
+
+    Neo4j, Memgraph, MongoDB and PostgreSQL make `delete_node` durable as it
+    runs and their graph `index_done_callback` is a no-op, so a removal issued
+    before the cancellation-deferring region is already permanent while the
+    tracking rows it invalidates are still on disk. Every await in between --
+    the vector deletes, the relation rewrites -- can then exit with the object
+    gone and its rows stranded, and stranded is where they stay: retrying the
+    merge or rename fails its existence check, so nothing rediscovers them.
+
+    Both paths therefore issue the removal inside the region, exactly where
+    `adelete_by_entity` issues its own.
+    """
+
+    @pytest.mark.asyncio
+    async def test_merge_keeps_the_source_when_the_vector_delete_fails(
+        self, immediate_rag
+    ):
+        immediate_rag.entities_vdb.delete_error = _Boom("vector store down")
+
+        with pytest.raises(Exception):
+            await immediate_rag.merge()
+
+        assert SOURCE in immediate_rag.persisted_graph().nodes()
+        assert immediate_rag.entity_chunks.records[SOURCE] == CHUNKS
+        assert _rows_without_live_objects(immediate_rag) == []
+        assert _live_objects_without_rows(immediate_rag) == []
+
+    @pytest.mark.asyncio
+    async def test_rename_keeps_the_old_name_when_the_vector_delete_fails(
+        self, immediate_rag
+    ):
+        immediate_rag.entities_vdb.delete_error = _Boom("vector store down")
+
+        with pytest.raises(Exception):
+            await immediate_rag.rename()
+
+        assert SOURCE in immediate_rag.persisted_graph().nodes()
+        assert immediate_rag.entity_chunks.records[SOURCE] == CHUNKS
+        assert _rows_without_live_objects(immediate_rag) == []
+
+    @pytest.mark.asyncio
+    async def test_merge_retires_rows_when_cancelled_during_the_node_removal(
+        self, immediate_rag, monkeypatch
+    ):
+        caller = asyncio.current_task()
+        inner = immediate_rag.graph._inner
+        original = inner.delete_node
+
+        async def _delete_then_cancel(node_id):
+            await original(node_id)
+            caller.cancel()
+
+        monkeypatch.setattr(inner, "delete_node", _delete_then_cancel)
+
+        with pytest.raises(asyncio.CancelledError):
+            await immediate_rag.merge()
+
+        assert SOURCE not in immediate_rag.persisted_graph().nodes()
+        assert _rows_without_live_objects(immediate_rag) == []
+        assert _live_objects_without_rows(immediate_rag) == []
