@@ -163,3 +163,66 @@ async def test_drop_stays_successful_when_writer_flag_reset_fails(
         assert any("reset boom" in msg for msg in logged_errors)
     finally:
         await storage.finalize()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notification_fails", [False, True])
+async def test_cancelled_drop_finishes_notification_and_logs(
+    tmp_path, monkeypatch, notification_fails
+):
+    writer = _make_storage(tmp_path)
+    await writer.initialize()
+    await writer.upsert_node("n1", {"entity_id": "n1"})
+    await writer.index_done_callback()
+    peer = _make_storage(tmp_path)
+    await peer.initialize()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    notify = networkx_impl.set_all_update_flags
+    errors = []
+    infos = []
+
+    async def paused_notification(namespace, workspace=None):
+        started.set()
+        await release.wait()
+        # Model partial publication before a notification failure.
+        writer.storage_updated.value = True
+        finished.set()
+        if notification_fails:
+            raise RuntimeError("notification boom")
+        await notify(namespace, workspace=workspace)
+
+    monkeypatch.setattr(networkx_impl, "set_all_update_flags", paused_notification)
+    monkeypatch.setattr(networkx_impl.logger, "error", errors.append)
+    monkeypatch.setattr(networkx_impl.logger, "info", infos.append)
+    task = asyncio.create_task(writer.drop())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert not Path(writer._graphml_xml_file).exists()
+        task.cancel()
+        # Deliver cancellation while publication is still suspended.
+        await asyncio.sleep(0)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+        assert finished.is_set()
+        assert writer.storage_updated.value is False
+        assert writer._graph.number_of_nodes() == 0
+        assert any("drop graph file:" in msg for msg in infos)
+        if notification_fails:
+            assert any("notification boom" in msg for msg in errors)
+            assert any("restart" in msg for msg in errors)
+        else:
+            assert await asyncio.wait_for(peer.has_node("n1"), timeout=2) is False
+            # Writer ownership may move to this peer after the clear.
+            await peer.upsert_node("n2", {"entity_id": "n2"})
+            await peer.index_done_callback()
+            durable = NetworkXStorage.load_nx_graph(peer._graphml_xml_file)
+            assert set(durable.nodes) == {"n2"}
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await peer.finalize()
+        await writer.finalize()

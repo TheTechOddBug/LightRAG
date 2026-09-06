@@ -182,13 +182,15 @@ async def test_clear_documents_survives_ingress_clear_failure(tmp_path):
     assert pipeline_status.get("destructive_busy") is False
 
 
-async def test_clear_documents_counts_notified_failed_networkx_drop_as_success(
+async def test_clear_documents_counts_notification_failed_networkx_drop_as_success(
     tmp_path, monkeypatch
 ):
     """A peer reload-notification failure happens after the graph is gone.
 
-    The endpoint must continue deleting input files instead of reporting that
-    every storage survived and leaving the files ready for re-ingestion.
+    Other storages succeed in this fixture, so input files are deleted even
+    before the fix. The regression assertion is the response status: a
+    completed graph drop must not be counted as a storage error and turn
+    success into partial_success.
     """
     workspace = f"clear-networkx-notify-{uuid4().hex[:8]}"
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
@@ -218,7 +220,7 @@ async def test_clear_documents_counts_notified_failed_networkx_drop_as_success(
             raise RuntimeError("notification boom")
 
         monkeypatch.setattr(networkx_impl, "set_all_update_flags", notification_boom)
-        input_file = tmp_path / "would-be-reingested.txt"
+        input_file = tmp_path / "cleared-input.txt"
         input_file.write_text("already cleared graph data")
 
         rag = _ClearRag(workspace)

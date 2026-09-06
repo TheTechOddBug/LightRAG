@@ -1110,48 +1110,64 @@ class NetworkXStorage(BaseGraphStorage):
 
             A peer notification failure after the file deletion is logged but
             does not change the successful status of the completed drop.
+            This status confirms durable deletion, not convergence of all worker
+            snapshots. A worker that missed the notification may later write its
+            stale graph back. Stop workspace writes and restart affected workers
+            before resuming; if stale data has already been written, clear again.
+
+        Cancellation:
+            Before submission, cancellation leaves storage unchanged. Once file
+            deletion is submitted, the storage lock stays held until deletion
+            and its notification/reset/logging hook finish, then caller
+            cancellation propagates. Notification errors are still logged.
         """
+
+        def _delete_file() -> None:
+            if os.path.exists(self._graphml_xml_file):
+                os.remove(self._graphml_xml_file)
+
+        async def _committed() -> None:
+            self._graph = nx.Graph()
+            # Keep publication under the storage lock. Once deletion starts,
+            # commit_in_storage_io defers caller cancellation through this hook
+            # so it cannot release readers before the notification attempt.
+            try:
+                await set_all_update_flags(self.namespace, workspace=self.workspace)
+            except Exception as notification_error:
+                # Notification can fail partway through the registered flags.
+                # A missed worker may later become the writer and persist its
+                # stale graph, resurrecting deleted data. A notification from
+                # that writer would spread the stale state, not repair it.
+                logger.error(
+                    f"[{self.workspace}] Dropped graph file:{self._graphml_xml_file}, "
+                    "but failed while notifying all processes; some processes may "
+                    "not reload and may restore deleted data if they later write. "
+                    "Stop workspace writes and restart all affected workers before "
+                    f"resuming: {notification_error}"
+                )
+            # The local graph is already empty, even after partial notification.
+            # A broken shared-state manager can fail this reset independently;
+            # report it without misclassifying the durable deletion as failed.
+            try:
+                self.storage_updated.value = False
+            except Exception as reset_error:
+                logger.error(
+                    f"[{self.workspace}] Dropped graph file:{self._graphml_xml_file}, "
+                    f"but failed to reset the writer reload flag: {reset_error}"
+                )
+            # Log inside the cancellation-protected hook: the caller may receive
+            # CancelledError after it completes instead of a success response.
+            logger.info(
+                f"[{self.workspace}] Process {os.getpid()} drop graph file:{self._graphml_xml_file}"
+            )
+
         try:
             async with self._storage_lock:
-                # delete _client_file_name
-                if os.path.exists(self._graphml_xml_file):
-                    os.remove(self._graphml_xml_file)
-                self._graph = nx.Graph()
-                # The file deletion above is the durable operation. Cross-process
-                # notification cannot make that deletion fail. Keep notification and
-                # writer-flag reset under the lock so readers cannot pass between the
-                # deletion and publication of the reload signal.
-                # ``set_all_update_flags`` updates peers one by one, so an exception may
-                # mean that only some readers missed the reload signal. Those
-                # readers retain a stale snapshot until a later successful
-                # notification or a process restart reloads the durable state.
-                try:
-                    await set_all_update_flags(self.namespace, workspace=self.workspace)
-                except Exception as notification_error:
-                    logger.error(
-                        f"[{self.workspace}] Dropped graph file:{self._graphml_xml_file}, "
-                        "but failed while notifying all processes; some processes may "
-                        f"not reload: {notification_error}"
-                    )
-                # The writer already owns the new empty graph and must not reload
-                # itself even when peer notification stopped partway through. A broken
-                # shared-state manager can make this assignment fail independently;
-                # that degradation still cannot undo the durable deletion.
-                try:
-                    self.storage_updated.value = False
-                except Exception as reset_error:
-                    logger.error(
-                        f"[{self.workspace}] Dropped graph file:{self._graphml_xml_file}, "
-                        f"but failed to reset the writer reload flag: {reset_error}"
-                    )
-
+                await commit_in_storage_io(_delete_file, _committed)
         except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error dropping graph file:{self._graphml_xml_file}: {e}"
             )
             return {"status": "error", "message": str(e)}
 
-        logger.info(
-            f"[{self.workspace}] Process {os.getpid()} drop graph file:{self._graphml_xml_file}"
-        )
         return {"status": "success", "message": "data dropped"}
