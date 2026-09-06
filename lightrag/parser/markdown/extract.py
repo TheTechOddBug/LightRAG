@@ -608,11 +608,11 @@ def _consume_html_table(lines: list[str], start: int) -> tuple[int, str, str]:
     line, col = finder.end_pos  # 1-indexed line relative to what was fed
     # getpos() lands at the start of the closing tag ("</table" or a
     # case-varied/whitespace-padded equivalent); find its terminating ">" in
-    # the original text rather than reconstructing the tag ourselves. Valid
-    # HTML allows whitespace between the tag name and ">" (e.g. "</table\n>"),
-    # so the ">" itself may land on a later line than where "</table" started
-    # -- keep searching forward across lines rather than only the one
-    # getpos() reported.
+    # the consumed source rather than reconstructing the tag ourselves. The
+    # parser can report a token's start only after receiving later input, so
+    # search forward through the lines it consumed. Inputs for which
+    # HTMLParser emits no end-tag event remain unsupported and fall back to
+    # plain text.
     gt_line_idx = start + line - 1
     search_col = col
     gt = -1

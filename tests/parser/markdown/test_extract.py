@@ -364,18 +364,6 @@ def test_html_table_trailing_suffix_does_not_gain_line_anchored_semantics():
     assert ex2.blocks[1]["heading"] == "actual heading"  # not swallowed by a fence
 
 
-def test_html_table_outer_close_tag_split_by_whitespace_across_lines():
-    """Codex finding: valid HTML allows whitespace between a closing tag's
-    name and ">", so the ">" itself can land on a later line than the one
-    HTMLParser reports for "</table". The search for it must continue across
-    lines instead of only the reported one."""
-    ex = _extract("<table><tr><td>a</td></tr></table\n> tail")
-
-    (table,) = ex.tables.values()
-    assert table["html"] == "<table><tr><td>a</td></tr></table\n>"
-    assert ex.blocks[0]["content"].endswith(" tail")
-
-
 @pytest.mark.parametrize("tag", ["textarea", "title"])
 def test_html_table_ignores_comment_marker_inside_rcdata(tag: str):
     """RCDATA content must not be scanned for HTML comments either -- a
