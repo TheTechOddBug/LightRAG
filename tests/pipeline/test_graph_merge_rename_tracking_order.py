@@ -795,7 +795,7 @@ class TestADurableMergeIsNeverReportedAsNotHavingHappened:
 
 
 class TestMigratedRowsAreDurableBeforeTheRemovalCommit:
-    """The new keys must reach disk before the commit that removes the old ones.
+    """A graph commit may only publish objects whose tracking rows are on disk.
 
     On the default `JsonKVStorage` an upsert only updates shared memory; the
     rows land on disk in `index_done_callback`. With the tracking flush after
@@ -829,21 +829,26 @@ class TestMigratedRowsAreDurableBeforeTheRemovalCommit:
 
         await rag.merge()
 
-        removal = [s for s in snapshots if SOURCE not in s["nodes"]]
-        assert removal, f"no commit removed the source; snapshots={snapshots}"
-        at_removal = removal[0]
-        target_row = at_removal["entities"].get(TARGET, {})
-        assert "chunk-src" in target_row.get("chunk_ids", []), (
-            "the source was removed while the target's merged tracking row "
-            f"existed only in memory; snapshot={at_removal}"
-        )
-        merged_relation = at_removal["relations"].get(
-            make_relation_chunk_key(TARGET, OTHER), {}
-        )
-        assert "chunk-src" in merged_relation.get("chunk_ids", []), (
-            "the redirected relation's merged row was not on disk when the "
-            f"source was removed; snapshot={at_removal}"
-        )
+        # EVERY commit, not just the one that removes the source. The merge
+        # commits twice, and the first one already publishes the merged target
+        # and its redirected relations -- so the rows have to be on disk by
+        # then. Checking only the removal commit left that first publication
+        # outside the invariant.
+        assert len(snapshots) >= 2, f"expected two commits; snapshots={snapshots}"
+        for index, snapshot in enumerate(snapshots):
+            target_row = snapshot["entities"].get(TARGET, {})
+            assert "chunk-src" in target_row.get("chunk_ids", []), (
+                f"commit {index} published the merged target while its tracking "
+                f"row existed only in memory; snapshot={snapshot}"
+            )
+            merged_relation = snapshot["relations"].get(
+                make_relation_chunk_key(TARGET, OTHER), {}
+            )
+            assert "chunk-src" in merged_relation.get("chunk_ids", []), (
+                f"commit {index} published the redirected relation while its "
+                f"merged row existed only in memory; snapshot={snapshot}"
+            )
+        assert SOURCE not in snapshots[-1]["nodes"]
 
     @pytest.mark.asyncio
     async def test_rename_persists_the_new_rows_before_removing_the_old_name(

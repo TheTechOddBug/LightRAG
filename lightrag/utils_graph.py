@@ -2060,7 +2060,7 @@ async def _merge_entities_impl(
         storage upsert fails after retries (steps 7/8), this function raises
         VectorStorageConsistencyError instead of attempting any rollback: the
         graph already holds the merged state, no data is lost, and the source
-        entities have NOT been deleted yet (step 10 is never reached). The
+        entities have NOT been deleted yet (step 11 is never reached). The
         vector storage may then lag behind the graph; running the offline
         rebuild tool (``lightrag-rebuild-vdb``) restores full consistency.
     """
@@ -2257,7 +2257,7 @@ async def _merge_entities_impl(
     # so only keys outside the new key set are deleted; deleting them after
     # the upsert would drop the rows just written.
     #
-    # Bound before the guard, not inside it: step 10b reads this list
+    # Bound before the guard, not inside it: step 11b reads this list
     # unconditionally, and merging entities that carry no incident edges
     # leaves `all_relations` empty. Assigning only in the branch below made
     # that case raise UnboundLocalError AFTER the graph commit had already
@@ -2278,7 +2278,7 @@ async def _merge_entities_impl(
                 f"Entity Merge: {len(updates)} relation chunk tracking records updated"
             )
 
-        # Deleted only in step 10b, once the graph state that replaced these
+        # Deleted only in step 11b, once the graph state that replaced these
         # keys is durable. Deleting here would retire the authoritative rows of
         # relations that are still on disk -- either because the redirected
         # edges have not been committed yet, or because the source node whose
@@ -2414,51 +2414,8 @@ async def _merge_entities_impl(
         ) from e
     logger.info(f"Entity Merge: updating vdb `{target_entity}`")
 
-    # 8b. Persist the graph and vector storages now — before any source-entity
-    # deletion (step 10). Deferred-embedding backends (e.g. nano/faiss) do NOT
-    # call the embedder inside upsert(); they embed and persist in
-    # index_done_callback, so an embedder outage surfaces only at flush time,
-    # outside the upsert try/except above. Flushing here, while the source
-    # entities are still intact, keeps the fail-loud guarantee true for those
-    # backends: on failure we raise VectorStorageConsistencyError before
-    # deleting anything, and the error message ("source entities not deleted")
-    # remains accurate. The graph is flushed first so it is the authoritative
-    # on-disk source the offline rebuild tool can recover from.
-    #
-    # Checked, not bare: a declined commit RELOADS the graph from disk and
-    # discards the in-memory merge (see _commit_graph_or_raise). Continuing past
-    # that would run step 10's node deletions against the reloaded state, so a
-    # later successful commit would publish the source entities' removal without
-    # the relation redirection that is supposed to preserve them.
-    await _commit_graph_or_raise(
-        chunk_entity_relation_graph, f"Entity Merge: into '{target_entity}'"
-    )
-    try:
-        await safe_vdb_operation_with_exception(
-            operation=relationships_vdb.index_done_callback,
-            operation_name="merge_relation_flush",
-            entity_name=target_entity,
-            max_retries=3,
-            retry_delay=0.2,
-        )
-        await safe_vdb_operation_with_exception(
-            operation=entities_vdb.index_done_callback,
-            operation_name="merge_entity_flush",
-            entity_name=target_entity,
-            max_retries=3,
-            retry_delay=0.2,
-        )
-    except Exception as e:
-        raise VectorStorageConsistencyError(
-            f"Vector storage flush failed after merging entities into '{target_entity}': {e}. "
-            "The knowledge graph was updated but the vector storage embeddings could not be "
-            "persisted, so they may now be inconsistent. No data is lost (the graph is the "
-            "authoritative source and the source entities were not deleted). Stop the LightRAG "
-            "server and run the offline rebuild tool (lightrag-rebuild-vdb) to restore consistency."
-        ) from e
-
-    # The sources that step 10 actually removes, and whose tracking rows step
-    # 10b retires once that removal is durable -- never before it: a row retired
+    # The sources that step 11 actually removes, and whose tracking rows step
+    # 11b retires once that removal is durable -- never before it: a row retired
     # ahead of the object it describes is the state the purge recovery contract
     # forbids. Bound here, ahead of every consumer, so the retirement never
     # depends on a branch having run -- the shape of the `stale_relation_keys`
@@ -2549,7 +2506,80 @@ async def _merge_entities_impl(
                 f"Entity Merge: find {len(merged_chunk_ids)} chunks related to '{target_entity}'"
             )
 
-    # 10. Delete the source entities' vector records, BEFORE the node removals
+    # 9b. Make every migrated row durable BEFORE the first commit that publishes
+    # the objects they describe. On a deferred KV backend (the default
+    # JsonKVStorage) an upsert only touches shared memory, so a commit ahead of
+    # this flush publishes new graph objects whose authoritative tracking exists
+    # nowhere on disk -- and a process exit in between comes back to a graph
+    # that can only fall back to the KEEP-truncated `source_id` a purge misreads.
+    #
+    # The invariant is stated over EVERY commit in this function, not just the
+    # source removal: a graph commit may only publish objects whose tracking
+    # rows are already on disk. That is why the tracking construction above was
+    # moved ahead of step 8b as well -- covering only the removal commit left
+    # the first publication (the merged target and its redirected relations)
+    # outside it.
+    #
+    # Flushing first leaves the opposite residue: rows on disk for objects that
+    # do not exist yet, which is dead bookkeeping a retry overwrites -- the same
+    # trade f86ef93c settled for the upsert-before-delete ordering.
+    try:
+        await _persist_graph_updates(
+            entity_chunks_storage=entity_chunks_storage,
+            relation_chunks_storage=relation_chunks_storage,
+        )
+    except Exception as e:
+        raise VectorStorageConsistencyError(
+            f"Persisting the migrated chunk tracking failed while merging into "
+            f"'{target_entity}': {e}. Nothing has been published yet -- the "
+            "source entities are intact and still carry their chunk tracking, "
+            "so no provenance is lost. Retry the merge."
+        ) from e
+
+    # 10. Persist the graph and vector storages now — before any source-entity
+    # deletion (step 11). Deferred-embedding backends (e.g. nano/faiss) do NOT
+    # call the embedder inside upsert(); they embed and persist in
+    # index_done_callback, so an embedder outage surfaces only at flush time,
+    # outside the upsert try/except above. Flushing here, while the source
+    # entities are still intact, keeps the fail-loud guarantee true for those
+    # backends: on failure we raise VectorStorageConsistencyError before
+    # deleting anything, and the error message ("source entities not deleted")
+    # remains accurate. The graph is flushed first so it is the authoritative
+    # on-disk source the offline rebuild tool can recover from.
+    #
+    # Checked, not bare: a declined commit RELOADS the graph from disk and
+    # discards the in-memory merge (see _commit_graph_or_raise). Continuing past
+    # that would run step 11's node deletions against the reloaded state, so a
+    # later successful commit would publish the source entities' removal without
+    # the relation redirection that is supposed to preserve them.
+    await _commit_graph_or_raise(
+        chunk_entity_relation_graph, f"Entity Merge: into '{target_entity}'"
+    )
+    try:
+        await safe_vdb_operation_with_exception(
+            operation=relationships_vdb.index_done_callback,
+            operation_name="merge_relation_flush",
+            entity_name=target_entity,
+            max_retries=3,
+            retry_delay=0.2,
+        )
+        await safe_vdb_operation_with_exception(
+            operation=entities_vdb.index_done_callback,
+            operation_name="merge_entity_flush",
+            entity_name=target_entity,
+            max_retries=3,
+            retry_delay=0.2,
+        )
+    except Exception as e:
+        raise VectorStorageConsistencyError(
+            f"Vector storage flush failed after merging entities into '{target_entity}': {e}. "
+            "The knowledge graph was updated but the vector storage embeddings could not be "
+            "persisted, so they may now be inconsistent. No data is lost (the graph is the "
+            "authoritative source and the source entities were not deleted). Stop the LightRAG "
+            "server and run the offline rebuild tool (lightrag-rebuild-vdb) to restore consistency."
+        ) from e
+
+    # 11. Delete the source entities' vector records, BEFORE the node removals
     # below. Same order, and same reason, as adelete_by_entity: on an
     # immediate-write graph backend (Neo4j, Memgraph, MongoDB, PostgreSQL --
     # their graph `index_done_callback` is a no-op) `delete_node` is durable the
@@ -2586,7 +2616,7 @@ async def _merge_entities_impl(
                 "offline rebuild tool (lightrag-rebuild-vdb) is run."
             ) from e
 
-    # 10b. Make the source entities' removal durable, and only then retire the
+    # 11b. Make the source entities' removal durable, and only then retire the
     # tracking rows they and their old relation keys owned. Same staging as
     # adelete_by_entity, and for the same reason: an authoritative row must
     # never predecease the object it describes, because a later
@@ -2599,28 +2629,6 @@ async def _merge_entities_impl(
     # overwritten by a retry; a row that is absent while its object lives is the
     # bug. Both invariants hold with the upserts before the commit and the
     # deletes after it.
-    # Make the migrated rows durable BEFORE the commit that removes the objects
-    # the old rows describe. On a deferred KV backend (the default
-    # JsonKVStorage) an upsert only touches shared memory, so without this the
-    # commit below would publish the new graph while the surviving objects' rows
-    # existed nowhere on disk -- and a process exit in between would come back
-    # to a graph whose entities have no authoritative tracking at all, falling
-    # back to the KEEP-truncated graph source_id a purge can misread. Flushing
-    # first leaves the opposite residue: new rows on disk for objects that do
-    # not exist yet, which is dead bookkeeping a retry overwrites.
-    try:
-        await _persist_graph_updates(
-            entity_chunks_storage=entity_chunks_storage,
-            relation_chunks_storage=relation_chunks_storage,
-        )
-    except Exception as e:
-        raise VectorStorageConsistencyError(
-            f"Persisting the migrated chunk tracking failed while finalizing the "
-            f"merge into '{target_entity}': {e}. The source entities were NOT "
-            "removed and still carry their chunk tracking, so nothing has lost "
-            "its provenance. Retry the merge; it is idempotent from this state."
-        ) from e
-
     async def _commit_source_removal_and_retire_tracking() -> None:
         # The node removals belong INSIDE the region, not before it: on an
         # immediate-write graph backend they are durable as they run, so a
@@ -2719,7 +2727,7 @@ async def _merge_entities_impl(
         f"Entity Merge: source removal and tracking cleanup for '{target_entity}'",
     )
 
-    # 11. Save the vector storages. The graph is already committed above, so
+    # 12. Save the vector storages. The graph is already committed above, so
     # flushing it again here would rewrite the whole file for nothing.
     try:
         await _persist_graph_updates(
