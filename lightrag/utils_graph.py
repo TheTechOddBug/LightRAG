@@ -1075,13 +1075,26 @@ async def _edit_entity_impl(
         for storage, key in tracking_keys_to_retire:
             try:
                 await storage.delete([key])
-            except Exception:
+            except Exception as e:
+                orphaned = [k for _, k in tracking_keys_to_retire]
                 logger.error(
                     "Entity Edit: failed to retire chunk tracking after renaming "
                     f"`{original_entity_name}`; these rows are now orphaned: "
-                    f"{[k for _, k in tracking_keys_to_retire]}"
+                    f"{orphaned}"
                 )
-                raise
+                # Typed for the same reason as the merge path: the rename is
+                # already durable here, so a failure that reads as "the rename
+                # did not happen" would be a lie about the graph.
+                raise VectorStorageConsistencyError(
+                    f"Retiring the chunk tracking of `{original_entity_name}` failed "
+                    f"after renaming it to `{new_entity_name}`: {e}. The rename "
+                    "itself is durable -- the old node is gone and its relations "
+                    f"were republished -- but these rows survive as orphans: "
+                    f"{orphaned}. They describe objects that no longer exist and are "
+                    "dead bookkeeping unless the same keys reappear later, at which "
+                    "point extraction would read them back as authoritative "
+                    "provenance."
+                ) from e
 
         # Flushed inside the region: on a deferred KV backend the deletes above
         # only touch memory, so a cancellation delivered before this flush would
@@ -1345,14 +1358,17 @@ async def aedit_entity(
                         return {**merge_result, "operation_summary": operation_summary}
 
                     except VectorStorageConsistencyError:
-                        # Fail-loud: the graph was updated but the vector storage
-                        # could not be persisted. This must reach the caller (mapped
-                        # to a 500 with rebuild guidance by the route), NOT be folded
-                        # into a partial-success summary that returns HTTP 200.
+                        # Fail-loud: the merge is durably applied to the graph and
+                        # a step after it -- the vector storage write, or the
+                        # chunk-tracking retirement -- did not complete. This must
+                        # reach the caller (mapped to a 500 by the route), NOT be
+                        # folded into the partial-success summary below, which
+                        # answers HTTP 200 and names `entity_name` as the surviving
+                        # entity: the very source this merge has just removed.
                         logger.error(
                             f"Entity Edit: merge of '{entity_name}' into "
-                            f"'{new_entity_name}' left graph and vector storage "
-                            "inconsistent; re-raising VectorStorageConsistencyError"
+                            f"'{new_entity_name}' is durable but a following step "
+                            "failed; re-raising VectorStorageConsistencyError"
                         )
                         raise
 
@@ -2587,24 +2603,49 @@ async def _merge_entities_impl(
                 "idempotent from this state."
             ) from e
 
+        # A failure below is raised as VectorStorageConsistencyError, not bare:
+        # the merge is already durable at this point, and only that type is
+        # re-raised by the `allow_merge` handler in `_edit_entity_impl`.
+        # Anything else is folded there into a partial-success summary that
+        # answers HTTP 200 with `final_entity` set to the source entity -- a
+        # source this commit has just removed. Reporting a landed merge as one
+        # that did not happen is worse than the orphan rows themselves.
         if relation_chunks_storage is not None and stale_relation_keys:
             try:
                 await relation_chunks_storage.delete(stale_relation_keys)
-            except Exception:
+            except Exception as e:
                 logger.error(
                     "Entity Merge: failed to retire relation chunk tracking; "
                     f"these rows are now orphaned: {stale_relation_keys}"
                 )
-                raise
+                raise VectorStorageConsistencyError(
+                    f"Retiring the relation chunk tracking failed while finalizing "
+                    f"the merge into '{target_entity}': {e}. The merge itself is "
+                    "durable -- the source entities are removed and their relations "
+                    "redirected -- but the tracking rows of the replaced relation "
+                    f"keys survive as orphans: {stale_relation_keys}. They describe "
+                    "objects that no longer exist and are dead bookkeeping unless "
+                    "the same relation endpoints reappear later, at which point "
+                    "extraction would read them back as authoritative provenance."
+                ) from e
         if entity_chunks_storage is not None and entities_to_remove:
             try:
                 await entity_chunks_storage.delete(entities_to_remove)
-            except Exception:
+            except Exception as e:
                 logger.error(
                     "Entity Merge: failed to retire entity chunk tracking; "
                     f"these rows are now orphaned: {entities_to_remove}"
                 )
-                raise
+                raise VectorStorageConsistencyError(
+                    f"Retiring the entity chunk tracking failed while finalizing the "
+                    f"merge into '{target_entity}': {e}. The merge itself is durable "
+                    "-- the source entities are removed and their relations "
+                    "redirected -- but their tracking rows survive as orphans: "
+                    f"{entities_to_remove}. They describe entities that no longer "
+                    "exist and are dead bookkeeping unless the same names are "
+                    "extracted again, at which point extraction would read them back "
+                    "as authoritative provenance."
+                ) from e
 
         # Flushed inside the region, not after it: on a deferred KV backend the
         # deletes above only touch memory, so a cancellation delivered between

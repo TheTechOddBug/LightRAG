@@ -33,7 +33,7 @@ import pytest
 from lightrag import utils_graph
 from lightrag.kg.networkx_impl import NetworkXStorage
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
-from lightrag.utils import make_relation_chunk_key
+from lightrag.utils import VectorStorageConsistencyError, make_relation_chunk_key
 
 pytestmark = pytest.mark.offline
 
@@ -63,6 +63,7 @@ class _KVStorage:
         self.tag = tag
         self.records: dict = {}
         self.timeline: list = []
+        self.delete_error: BaseException | None = None
 
     async def get_by_id(self, key):
         return self.records.get(key)
@@ -81,6 +82,8 @@ class _KVStorage:
         # aimed at the retirement step and `TestCancellationDoesNotStrandRows`
         # could not tell a protected cleanup from an unprotected one.
         await asyncio.sleep(0)
+        if self.delete_error is not None:
+            raise self.delete_error
         self.timeline.append(("delete", self.tag, sorted(ids)))
         for key in ids:
             self.records.pop(key, None)
@@ -278,6 +281,25 @@ class _Fixture:
             TARGET,
             None,
             None,
+            self.entity_chunks,
+            self.relation_chunks,
+        )
+
+    async def merge_via_edit(self):
+        """The merge reached through `aedit_entity(allow_merge=True)`.
+
+        Renaming onto an existing name is routed into `_merge_entities_impl` by
+        `_edit_entity_impl`, and that wrapper is where a post-commit failure can
+        be downgraded into a partial-success summary.
+        """
+        return await utils_graph.aedit_entity(
+            self.graph,
+            self.entities_vdb,
+            self.relationships_vdb,
+            SOURCE,
+            {"entity_name": TARGET},
+            True,
+            True,
             self.entity_chunks,
             self.relation_chunks,
         )
@@ -677,3 +699,39 @@ class TestADurableWriteWhoseNotificationFailedIsStillDurable:
         assert rag.entity_chunks.records[RENAMED] == CHUNKS
         assert _rows_without_live_objects(rag) == []
         assert _live_objects_without_rows(rag) == []
+
+
+class TestADurableMergeIsNeverReportedAsNotHavingHappened:
+    """A post-commit cleanup failure must not be downgraded to a partial success.
+
+    `aedit_entity(allow_merge=True)` routes a rename onto an existing name into
+    the merge, and its handler re-raises `VectorStorageConsistencyError` while
+    folding every other exception into a summary that answers HTTP 200 with
+    `final_entity` set to the SOURCE entity. Once the retirement runs, the merge
+    is durable and that source is gone -- so a bare failure there reported the
+    surviving entity as the one just deleted, and the caller was told the merge
+    had not happened. The retirement failures are therefore typed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failed_entity_row_retirement_is_raised_not_downgraded(self, rag):
+        rag.entity_chunks.delete_error = _Boom("tracking store down")
+
+        with pytest.raises(VectorStorageConsistencyError) as excinfo:
+            await rag.merge_via_edit()
+
+        message = str(excinfo.value)
+        assert "durable" in message
+        assert SOURCE in message
+        # The merge really did land: the report has to match that.
+        assert SOURCE not in rag.persisted_graph().nodes()
+        assert TARGET in rag.persisted_graph().nodes()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_relation_row_retirement_is_raised_not_downgraded(self, rag):
+        rag.relation_chunks.delete_error = _Boom("tracking store down")
+
+        with pytest.raises(VectorStorageConsistencyError):
+            await rag.merge_via_edit()
+
+        assert SOURCE not in rag.persisted_graph().nodes()
