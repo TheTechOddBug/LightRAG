@@ -1404,7 +1404,7 @@ merged weight = max(all input weights, distinct merged real source IDs)
 This preserves a larger manual boost while preventing the merged weight from
 falling below its evidence count.
 
-#### Chunk tracking across a rename or merge
+### Chunk tracking across a rename or merge
 
 A rename and a merge do not drop chunk tracking, they migrate it: the row moves
 to the surviving key. Two orderings have to hold at once for that migration to
