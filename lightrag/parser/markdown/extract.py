@@ -460,18 +460,37 @@ def extract_markdown(
                 out.tables[ref] = {"kind": "html", "html": html}
                 cur_lines.append(table_marker(ref))
                 has_block_payload = True
+                last_idx = i + consumed - 1
+                # A second supported table can immediately follow on the
+                # same line, e.g. "<table>A</table><table>B</table>" -- keep
+                # consuming exactly that construct from the suffix. This
+                # does NOT fall through to the general per-line dispatch:
+                # re-queuing arbitrary suffix text as a "line" would let it
+                # open a fence or start a heading it never was in the
+                # source (e.g. "<table>A</table># literal" must not become
+                # a real heading). `lines` is this function's own local
+                # list; overwriting an already-consumed index is safe.
+                while trailing and starts_with_html_tag(
+                    trailing.strip().lower(), "table"
+                ):
+                    lines[last_idx] = trailing
+                    sub_consumed, sub_html, sub_trailing = _consume_html_table(
+                        lines, last_idx
+                    )
+                    if sub_consumed == 0:
+                        # Not actually closed -- `trailing` keeps its
+                        # pre-attempt value (already written into
+                        # lines[last_idx]) so it falls through to the
+                        # plain-text emit below instead of being lost.
+                        break
+                    sub_ref = _next_ref("t")
+                    out.tables[sub_ref] = {"kind": "html", "html": sub_html}
+                    cur_lines.append(table_marker(sub_ref))
+                    last_idx += sub_consumed - 1
+                    trailing = sub_trailing
                 if trailing:
-                    # Feed the suffix back through the normal per-line
-                    # dispatch (not just inline-image resolution) so a
-                    # second same-line construct -- most notably another
-                    # <table>...</table>, e.g. "<table>A</table><table>B</table>"
-                    # -- is recognised instead of falling back to raw text.
-                    # `lines` is this function's own local list; overwriting
-                    # an already-consumed index and re-visiting it is safe.
-                    lines[i + consumed - 1] = trailing
-                    i += consumed - 1
-                else:
-                    i += consumed
+                    _emit_inline(trailing)
+                i = last_idx + 1
                 continue
 
         # --- pipe table ----------------------------------------------------
@@ -579,19 +598,31 @@ def _consume_html_table(lines: list[str], start: int) -> tuple[int, str, str]:
         return 0, "", ""
 
     line, col = finder.end_pos  # 1-indexed line relative to what was fed
-    target_line = lines[start + line - 1]
     # getpos() lands at the start of the closing tag ("</table" or a
     # case-varied/whitespace-padded equivalent); find its terminating ">" in
-    # the original text rather than reconstructing the tag ourselves.
-    gt = target_line.find(">", col)
+    # the original text rather than reconstructing the tag ourselves. Valid
+    # HTML allows whitespace between the tag name and ">" (e.g. "</table\n>"),
+    # so the ">" itself may land on a later line than where "</table" started
+    # -- keep searching forward across lines rather than only the one
+    # getpos() reported.
+    gt_line_idx = start + line - 1
+    search_col = col
+    gt = -1
+    while gt_line_idx < len(lines):
+        gt = lines[gt_line_idx].find(">", search_col)
+        if gt != -1:
+            break
+        gt_line_idx += 1
+        search_col = 0
     if gt == -1:
         return 0, "", ""
     end_col = gt + 1
 
-    html_lines = lines[start : start + line - 1] + [target_line[:end_col]]
+    target_line = lines[gt_line_idx]
+    html_lines = lines[start:gt_line_idx] + [target_line[:end_col]]
     html = "\n".join(html_lines).strip()
     trailing = target_line[end_col:]
-    return line, html, trailing
+    return (gt_line_idx - start + 1), html, trailing
 
 
 def _consume_pipe_table(
