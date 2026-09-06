@@ -204,21 +204,21 @@ class NetworkXStorage(BaseGraphStorage):
         to add a value after the check and before ``add_node`` /
         ``add_edge`` consumes it.
 
-    Non-pipeline write paths:
-        The pipeline's ``busy`` gate serializes mutation calls reached
-        through the document ingestion and purge flows. The following
-        entry points are **not** serialized by the pipeline gate and
-        must be guarded externally:
+    Writer entry points:
+        The pipeline's ``busy`` gate serializes document ingestion and purge.
+        ``LightRAG._graph_mutation_slot`` reserves that same writer slot for
+        ``insert_custom_kg`` and every public SDK entity/relation create, edit,
+        delete, and merge operation. This workspace-wide reservation is needed
+        even when per-entity keys differ: a NetworkX callback persists the
+        entire namespace, so it must never flush another writer's pending
+        mutation. The following lower-level entry points still require their
+        caller to provide the reservation:
             * ``drop`` — currently gated by the API layer (the
               ``/documents/clear`` endpoint takes the pipeline busy
               reservation before invoking it).
             * ``delete_node`` / ``remove_nodes`` / ``remove_edges`` /
               ``upsert_node`` / ``upsert_edge`` when invoked from
-              ``utils_graph.py`` admin flows (``adelete_by_entity`` /
-              ``adelete_by_relation`` / entity-edit flows). These flows
-              are currently not exposed in the WebUI; any future caller
-              must arrange single-writer serialization the same way the
-              pipeline does.
+              ``utils_graph.py`` directly instead of through ``LightRAG``.
     """
 
     def _node_context(self, node_id: str) -> str:
@@ -525,10 +525,9 @@ class NetworkXStorage(BaseGraphStorage):
             a subsequent ``index_done_callback``. Callers outside the
             pipeline must persist explicitly.
 
-        Pipeline-gating depends on the caller: invocations from the
-        document purge flow are serialized by ``pipeline busy``;
-        invocations from ``utils_graph.py`` admin flows are **not** —
-        see class docstring *Non-pipeline write paths*.
+        Public SDK and document-purge callers hold the workspace writer slot;
+        direct ``utils_graph.py`` callers must provide it themselves. See the
+        class docstring *Writer entry points*.
         """
         graph = await self._get_graph()
         if graph.has_node(node_id):
@@ -548,7 +547,7 @@ class NetworkXStorage(BaseGraphStorage):
             pipeline must persist explicitly.
 
         Pipeline-gating depends on the caller — see ``delete_node`` and
-        class docstring *Non-pipeline write paths*.
+        class docstring *Writer entry points*.
 
         Args:
             nodes: List of node IDs to be deleted
@@ -567,7 +566,7 @@ class NetworkXStorage(BaseGraphStorage):
             pipeline must persist explicitly.
 
         Pipeline-gating depends on the caller — see ``delete_node`` and
-        class docstring *Non-pipeline write paths*.
+        class docstring *Writer entry points*.
 
         Args:
             edges: List of edges to be deleted, each edge is a (source, target) tuple

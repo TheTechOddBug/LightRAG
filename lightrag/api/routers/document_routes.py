@@ -1800,22 +1800,20 @@ async def _reserve_enqueue_slot(
 async def check_pipeline_busy_or_raise(rag: LightRAG) -> None:
     """Refuse the request with HTTP 409 when the document pipeline is busy.
 
-    Intended for short, fine-grained graph mutations (entity/relation
+    Provides an early HTTP 409 for short graph mutations (entity/relation
     edit/create/delete/merge). Reads ``pipeline_status['busy']`` under
-    the namespace lock and raises immediately on contention -- it does
-    NOT set any flag, so it cannot block the pipeline itself.
+    the namespace lock and raises immediately on contention. The underlying
+    ``LightRAG`` SDK method then takes ``_graph_mutation_slot``; that reservation
+    closes the check-to-write race and supplies the actual writer exclusion.
 
     ``busy`` is set by the processing loop and by destructive jobs
     (``/documents/clear`` / per-doc delete). Both paths concurrently
     write the same graph storages that these endpoints mutate, so a
     409 here mirrors the existing UI guard and tells clients to wait.
 
-    A narrow race remains between this check and the underlying graph
-    write: if the pipeline transitions to busy in that window, the
-    per-edge/-node locks inside the storage layer are the last line of
-    defense. That trade-off is deliberate -- holding ``busy`` here
-    would serialise every UI edit against document ingestion, which is
-    a worse user-visible failure mode than tolerating the race.
+    A pipeline may become busy after this advisory check. In that case the SDK
+    reservation refuses before the graph write begins; route handlers translate
+    that failure through their existing error path.
 
     No-op (returns silently) when ``pipeline_status`` was never
     bootstrapped, matching the behaviour of ``_acquire_destructive_busy``

@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 import warnings
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
@@ -107,7 +108,6 @@ from lightrag.kg.shared_storage import (
     PipelineReservationConflict,
     acquire_reservation,
     append_pipeline_history,
-    check_pipeline_status_mutation,
     get_namespace_data,
     get_default_workspace,
     set_default_workspace,
@@ -3520,6 +3520,21 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         custom_kg: dict[str, Any],
         full_doc_id: str = None,
     ) -> None:
+        """Insert caller-constructed KG objects under the workspace writer slot.
+
+        This direct path remains outside document-level rollback, but its graph
+        commit is serialized with document processing and the entity/relation
+        admin APIs so whole-namespace backends cannot publish another writer's
+        pending changes.
+        """
+        async with self._graph_mutation_slot("custom KG insertion"):
+            await self._ainsert_custom_kg_unreserved(custom_kg, full_doc_id)
+
+    async def _ainsert_custom_kg_unreserved(
+        self,
+        custom_kg: dict[str, Any],
+        full_doc_id: str = None,
+    ) -> None:
         """Insert caller-constructed KG objects directly into the stores.
 
         Entity names and relationship endpoints are normalized with the same
@@ -3539,10 +3554,6 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
            offline ``lightrag.tools.kg_integrity_repair`` audit can
            reconstruct anchors for data written here after the fact.
         """
-        # Direct KG write path — refuse on a fenced workspace (recovery_required)
-        # like the other SDK mutations, before touching any storage.
-        await self._raise_if_recovery_required()
-
         update_storage = False
         try:
             from lightrag.utils_graph import (
@@ -6493,18 +6504,21 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                             action=_terminal_release,
                         )
 
-    async def _raise_if_recovery_required(self) -> None:
-        """Refuse a graph/data mutation while the workspace is fenced for
-        recovery (a worker died mid custom_chunks/delete/clear, possibly leaving
-        storage partially committed).
+    @asynccontextmanager
+    async def _graph_mutation_slot(self, operation: str) -> AsyncIterator[None]:
+        """Reserve the workspace's single-writer slot for an SDK graph mutation.
 
-        The REST graph-edit routes go through ``check_pipeline_busy_or_raise``,
-        which already refuses a fenced workspace, but a DIRECT SDK caller of the
-        ``a{create,edit,delete,merge}_*`` methods bypasses that. This is the
-        SDK-level fence so "refuse all mutations while fenced" holds on both
-        paths. It intentionally does NOT check ``busy`` (SDK graph edits may run
-        concurrently with the pipeline, guarded by per-entity keyed locks). No-op
-        when pipeline_status was never initialised (test rigs).
+        NetworkX commits its whole graph namespace. Per-entity keyed locks keep
+        two writers from changing the same node or edge concurrently, but they
+        cannot stop an admin callback from publishing another writer's unrelated
+        pending graph mutation. Every public SDK graph writer therefore shares
+        the document pipeline's ``busy`` reservation from its first storage
+        access through its final callback.
+
+        Test rigs that never bootstrap ``pipeline_status`` keep the historical
+        no-op behavior. Enqueues accepted while this short mutation is running
+        are handed directly to the processing loop before the slot is released,
+        matching the document-delete and custom-chunk writer exits.
         """
         from lightrag.exceptions import PipelineNotInitializedError
 
@@ -6513,15 +6527,111 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 "pipeline_status", workspace=self.workspace
             )
         except PipelineNotInitializedError:
+            yield
             return
         pipeline_status_lock = get_namespace_lock(
             "pipeline_status", workspace=self.workspace
         )
-        result = await check_pipeline_status_mutation(
-            pipeline_status, pipeline_status_lock
-        )
-        if not result.acquired:
-            raise RuntimeError(result.message)
+        token = uuid.uuid4().hex
+
+        try:
+            reservation = await acquire_reservation(
+                pipeline_status,
+                pipeline_status_lock,
+                owner_key="busy_owner",
+                owner=token,
+                owner_kind="graph_mutation",
+                flags={
+                    "busy": True,
+                    "operation_record": {
+                        "kind": "graph_mutation",
+                        "operation": operation,
+                    },
+                    "job_name": f"Knowledge graph {operation}",
+                    "job_start": datetime.now(timezone.utc).isoformat(),
+                    "docs": 0,
+                    "batchs": 1,
+                    "cur_batch": 0,
+                    "cancellation_requested": False,
+                },
+                reject_when=(
+                    (
+                        "busy",
+                        "Pipeline is busy with another operation. Wait for the "
+                        "running job to finish before editing the knowledge graph.",
+                    ),
+                ),
+            )
+            if not reservation.acquired:
+                raise RuntimeError(reservation.message)
+
+            yield
+        finally:
+            try:
+                ingress = await get_pipeline_ingress(self.workspace)
+            except Exception as ingress_error:
+                ingress = None
+                logger.warning(
+                    "graph-mutation exit: pipeline ingress unavailable; "
+                    f"failing toward handoff: {ingress_error}"
+                )
+
+            def _release_action(status):
+                try:
+                    ingress_has_work = ingress is None or ingress.has_work()
+                except Exception as probe_error:
+                    ingress_has_work = True
+                    logger.warning(
+                        "graph-mutation exit: ingress probe failed; "
+                        f"failing toward handoff: {probe_error}"
+                    )
+                status.update(
+                    {
+                        "operation_record": None,
+                        "cancellation_requested": False,
+                    }
+                )
+                if ingress_has_work:
+                    return "handoff"
+                status.update({"busy": False, "busy_owner": None})
+                return "released"
+
+            def _terminal_release(status):
+                status.update(
+                    {
+                        "busy": False,
+                        "busy_owner": None,
+                        "operation_record": None,
+                        "cancellation_requested": False,
+                    }
+                )
+
+            try:
+                decision = await with_reservation_lock(
+                    pipeline_status,
+                    pipeline_status_lock,
+                    owner_key="busy_owner",
+                    token=token,
+                    action=_release_action,
+                )
+                if decision == "handoff":
+                    try:
+                        await self.apipeline_process_enqueue_documents(
+                            _holding_busy=True, token=token
+                        )
+                    except Exception as drain_error:
+                        logger.warning(
+                            "Failed to process queued documents handed off from "
+                            f"a graph mutation: {drain_error}"
+                        )
+            finally:
+                await with_reservation_lock(
+                    pipeline_status,
+                    pipeline_status_lock,
+                    owner_key="busy_owner",
+                    token=token,
+                    action=_terminal_release,
+                )
 
     async def adelete_by_entity(self, entity_name: str) -> DeletionResult:
         """Asynchronously delete an entity and all its relationships.
@@ -6532,18 +6642,17 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         Returns:
             DeletionResult: An object containing the outcome of the deletion process.
         """
-        await self._raise_if_recovery_required()
-
         from lightrag.utils_graph import adelete_by_entity
 
-        return await adelete_by_entity(
-            self.chunk_entity_relation_graph,
-            self.entities_vdb,
-            self.relationships_vdb,
-            entity_name,
-            entity_chunks_storage=self.entity_chunks,
-            relation_chunks_storage=self.relation_chunks,
-        )
+        async with self._graph_mutation_slot("entity deletion"):
+            return await adelete_by_entity(
+                self.chunk_entity_relation_graph,
+                self.entities_vdb,
+                self.relationships_vdb,
+                entity_name,
+                entity_chunks_storage=self.entity_chunks,
+                relation_chunks_storage=self.relation_chunks,
+            )
 
     def delete_by_entity(self, entity_name: str) -> DeletionResult:
         """Synchronously delete an entity and all its relationships.
@@ -6573,17 +6682,16 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         Returns:
             DeletionResult: An object containing the outcome of the deletion process.
         """
-        await self._raise_if_recovery_required()
-
         from lightrag.utils_graph import adelete_by_relation
 
-        return await adelete_by_relation(
-            self.chunk_entity_relation_graph,
-            self.relationships_vdb,
-            source_entity,
-            target_entity,
-            relation_chunks_storage=self.relation_chunks,
-        )
+        async with self._graph_mutation_slot("relation deletion"):
+            return await adelete_by_relation(
+                self.chunk_entity_relation_graph,
+                self.relationships_vdb,
+                source_entity,
+                target_entity,
+                relation_chunks_storage=self.relation_chunks,
+            )
 
     def delete_by_relation(
         self, source_entity: str, target_entity: str
@@ -6708,21 +6816,20 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         Returns:
             Dictionary containing updated entity information
         """
-        await self._raise_if_recovery_required()
-
         from lightrag.utils_graph import aedit_entity
 
-        return await aedit_entity(
-            self.chunk_entity_relation_graph,
-            self.entities_vdb,
-            self.relationships_vdb,
-            entity_name,
-            updated_data,
-            allow_rename,
-            allow_merge,
-            self.entity_chunks,
-            self.relation_chunks,
-        )
+        async with self._graph_mutation_slot("entity edit"):
+            return await aedit_entity(
+                self.chunk_entity_relation_graph,
+                self.entities_vdb,
+                self.relationships_vdb,
+                entity_name,
+                updated_data,
+                allow_rename,
+                allow_merge,
+                self.entity_chunks,
+                self.relation_chunks,
+            )
 
     def edit_entity(
         self,
@@ -6759,19 +6866,18 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         Returns:
             Dictionary containing updated relation information
         """
-        await self._raise_if_recovery_required()
-
         from lightrag.utils_graph import aedit_relation
 
-        return await aedit_relation(
-            self.chunk_entity_relation_graph,
-            self.entities_vdb,
-            self.relationships_vdb,
-            source_entity,
-            target_entity,
-            updated_data,
-            self.relation_chunks,
-        )
+        async with self._graph_mutation_slot("relation edit"):
+            return await aedit_relation(
+                self.chunk_entity_relation_graph,
+                self.entities_vdb,
+                self.relationships_vdb,
+                source_entity,
+                target_entity,
+                updated_data,
+                self.relation_chunks,
+            )
 
     def edit_relation(
         self, source_entity: str, target_entity: str, updated_data: dict[str, Any]
@@ -6797,17 +6903,16 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         Returns:
             Dictionary containing created entity information
         """
-        await self._raise_if_recovery_required()
-
         from lightrag.utils_graph import acreate_entity
 
-        return await acreate_entity(
-            self.chunk_entity_relation_graph,
-            self.entities_vdb,
-            self.relationships_vdb,
-            entity_name,
-            entity_data,
-        )
+        async with self._graph_mutation_slot("entity creation"):
+            return await acreate_entity(
+                self.chunk_entity_relation_graph,
+                self.entities_vdb,
+                self.relationships_vdb,
+                entity_name,
+                entity_data,
+            )
 
     def create_entity(
         self, entity_name: str, entity_data: dict[str, Any]
@@ -6837,18 +6942,17 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         Returns:
             Dictionary containing created relation information
         """
-        await self._raise_if_recovery_required()
-
         from lightrag.utils_graph import acreate_relation
 
-        return await acreate_relation(
-            self.chunk_entity_relation_graph,
-            self.entities_vdb,
-            self.relationships_vdb,
-            source_entity,
-            target_entity,
-            relation_data,
-        )
+        async with self._graph_mutation_slot("relation creation"):
+            return await acreate_relation(
+                self.chunk_entity_relation_graph,
+                self.entities_vdb,
+                self.relationships_vdb,
+                source_entity,
+                target_entity,
+                relation_data,
+            )
 
     def create_relation(
         self, source_entity: str, target_entity: str, relation_data: dict[str, Any]
@@ -6891,21 +6995,20 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         Returns:
             Dictionary containing the merged entity information
         """
-        await self._raise_if_recovery_required()
-
         from lightrag.utils_graph import amerge_entities
 
-        return await amerge_entities(
-            self.chunk_entity_relation_graph,
-            self.entities_vdb,
-            self.relationships_vdb,
-            source_entities,
-            target_entity,
-            merge_strategy,
-            target_entity_data,
-            self.entity_chunks,
-            self.relation_chunks,
-        )
+        async with self._graph_mutation_slot("entity merge"):
+            return await amerge_entities(
+                self.chunk_entity_relation_graph,
+                self.entities_vdb,
+                self.relationships_vdb,
+                source_entities,
+                target_entity,
+                merge_strategy,
+                target_entity_data,
+                self.entity_chunks,
+                self.relation_chunks,
+            )
 
     def merge_entities(
         self,

@@ -1,5 +1,6 @@
 """Manual graph deletion must remove persisted provenance before a new generation."""
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ import numpy as np
 import pytest
 
 from lightrag import LightRAG
+from lightrag.base import DeletionResult
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.utils import EmbeddingFunc, Tokenizer, make_relation_chunk_key
 
@@ -158,4 +160,59 @@ async def test_delete_removes_tracking_before_reinsert(
                 new_chunk
             ]
     finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_sdk_deletion_reserves_workspace_writer_slot(tmp_path, monkeypatch):
+    """A deletion excludes both the pipeline and disjoint admin writers.
+
+    Per-entity locks do not collide for Atlas and Borealis, so this proves the
+    workspace reservation rather than accidentally relying on a shared key.
+    """
+    from lightrag.kg.shared_storage import get_namespace_data
+    from lightrag import utils_graph
+
+    rag = LightRAG(
+        working_dir=str(tmp_path),
+        workspace=f"tracking_slot_{uuid4().hex}",
+        llm_model_func=_no_llm,
+        embedding_func=EmbeddingFunc(embedding_dim=8, func=_embed),
+        tokenizer=Tokenizer("characters", _Characters()),
+    )
+    await rag.initialize_storages()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _blocked_delete(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return DeletionResult(
+            status="success", doc_id=args[3], message="deleted", status_code=200
+        )
+
+    monkeypatch.setattr(utils_graph, "adelete_by_entity", _blocked_delete)
+    first = asyncio.create_task(rag.adelete_by_entity("Atlas"))
+    try:
+        await entered.wait()
+        pipeline_status = await get_namespace_data(
+            "pipeline_status", workspace=rag.workspace
+        )
+        assert pipeline_status["busy"] is True
+        assert pipeline_status["operation_record"] == {
+            "kind": "graph_mutation",
+            "operation": "entity deletion",
+        }
+
+        with pytest.raises(RuntimeError, match="Pipeline is busy"):
+            await rag.adelete_by_entity("Borealis")
+
+        release.set()
+        assert (await first).status == "success"
+        assert pipeline_status["busy"] is False
+        assert pipeline_status["busy_owner"] is None
+    finally:
+        release.set()
+        if not first.done():
+            await first
         await rag.finalize_storages()

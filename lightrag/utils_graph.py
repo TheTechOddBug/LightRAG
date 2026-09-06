@@ -507,7 +507,6 @@ async def adelete_by_entity(
                 entity_chunks_storage=entity_chunks_storage,
                 relation_chunks_storage=relation_chunks_storage,
             )
-
             # PHASE 3 — vector stores last. Bundling their flush with the graph
             # would let a vector failure abort a deletion whose node is already
             # durably gone, stranding tracking rows the sweep cannot reach.
@@ -517,7 +516,6 @@ async def adelete_by_entity(
                 entities_vdb=entities_vdb,
                 relationships_vdb=relationships_vdb,
             )
-
             message = f"Entity Delete: remove '{entity_name}' and its {related_relations_count} relations"
             logger.info(message)
             return DeletionResult(
@@ -624,7 +622,6 @@ async def adelete_by_relation(
                 chunk_entity_relation_graph,
                 f"Relation Delete: `{source_entity}`~`{target_entity}`",
             )
-
             if relation_chunks_storage is not None:
                 await relation_chunks_storage.delete([storage_key])
                 logger.info(
@@ -635,7 +632,6 @@ async def adelete_by_relation(
             )
 
             await _persist_graph_updates(relationships_vdb=relationships_vdb)
-
             message = f"Relation Delete: `{source_entity}`~`{target_entity}` deleted successfully"
             logger.info(message)
             return DeletionResult(
