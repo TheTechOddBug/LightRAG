@@ -318,8 +318,8 @@ def test_html_table_ignores_quote_inside_style():
 
 def test_html_table_recognizes_second_same_line_table():
     """Codex finding: a second supported table on the same line as the
-    first's close must not be swallowed as inline prose -- the suffix is fed
-    back through normal block extraction so it gets its own entry too."""
+    first's close must not be swallowed as inline prose -- the targeted
+    table-only suffix retry gives it its own entry too."""
     ex = _extract("<table>A</table><table>B</table>")
 
     assert [t["html"] for t in ex.tables.values()] == [
@@ -351,11 +351,13 @@ def test_html_table_trailing_suffix_does_not_gain_line_anchored_semantics():
     same-line table gets the special-cased retry; everything else goes
     through plain inline-image resolution like before."""
     ex = _extract("<table>A</table># literal")
-    assert "# literal" in ex.blocks[0]["content"]
+    assert ex.blocks[0]["heading"] == PREFACE_HEADING
+    assert ex.blocks[0]["content"].endswith("# literal")
     assert len(ex.blocks) == 1  # no second, heading-split block
 
     ex2 = _extract("<table>A</table>```\n# actual heading")
     assert ex2.blocks[0]["heading"] == PREFACE_HEADING
+    assert ex2.blocks[0]["content"].endswith("```")
     assert ex2.blocks[1]["heading"] == "actual heading"  # not swallowed by a fence
 
 
