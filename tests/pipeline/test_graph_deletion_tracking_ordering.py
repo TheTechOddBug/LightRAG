@@ -206,7 +206,13 @@ class TestFailureLeavesProvenanceIntact:
 
 
 class TestOrphanRowsConverge:
-    """The residue of this order -- an orphan row -- must be recoverable."""
+    """The residue of this order -- an orphan row -- must be recoverable.
+
+    These use the immediate-write doubles, so the failing step is `delete()`
+    itself. The deferred counterpart -- a `delete()` that succeeded in memory
+    whose *commit* failed -- is a different failure with a different recovery,
+    and lives in `TestFailedCommitsAreRetried`.
+    """
 
     @pytest.mark.asyncio
     async def test_entity_tracking_failure_converges_on_retry(self, rag):
@@ -225,7 +231,6 @@ class TestOrphanRowsConverge:
 
         assert second.status == "not_found"
         assert ENTITY not in rag.entity_chunks.records
-        assert rag.entity_chunks.flushes == 1
         # Sweeping the orphan must not touch an unrelated entity's provenance.
         assert rag.entity_chunks.records[OTHER] == CHUNKS
 
@@ -243,10 +248,9 @@ class TestOrphanRowsConverge:
 
         assert second.status == "not_found"
         assert RELATION_KEY not in rag.relation_chunks.records
-        assert rag.relation_chunks.flushes == 1
 
     @pytest.mark.asyncio
-    async def test_not_found_without_orphan_row_skips_the_flush(self, rag):
+    async def test_not_found_for_an_unknown_name_touches_nothing(self, rag):
         result = await utils_graph.adelete_by_entity(
             rag.graph,
             rag.entities_vdb,
@@ -257,8 +261,8 @@ class TestOrphanRowsConverge:
         )
 
         assert result.status == "not_found"
-        assert rag.entity_chunks.flushes == 0
         assert set(rag.entity_chunks.records) == {ENTITY, OTHER}
+        assert set(rag.relation_chunks.records) == {RELATION_KEY}
 
     @pytest.mark.asyncio
     async def test_orphan_sweep_handles_a_legacy_shaped_row(self, rag):
@@ -286,6 +290,7 @@ class _DeferredKVStorage:
         self.commit_log = commit_log
         self.records: dict = {}
         self.disk: dict = {}
+        self.fail_commit_times = 0
 
     async def get_by_id(self, key):
         return deepcopy(self.records.get(key))
@@ -299,6 +304,9 @@ class _DeferredKVStorage:
 
     async def index_done_callback(self):
         self.commit_log.append(self.name)
+        if self.fail_commit_times > 0:
+            self.fail_commit_times -= 1
+            raise _Boom(f"{self.name} commit failed")
         self.disk = deepcopy(self.records)
 
 
@@ -450,4 +458,62 @@ class TestMixedBackendDurability:
 
         assert result.status == "fail"
         assert not deferred.persisted_graph().has_edge(ENTITY, OTHER)
+        assert RELATION_KEY not in deferred.relation_chunks.disk
+
+
+class TestFailedCommitsAreRetried:
+    """A retry must be able to commit what an earlier attempt left pending.
+
+    On a deferred backend a failed `index_done_callback` leaves the delete in
+    memory and the stale row on disk. Keying the retry's flush off in-memory row
+    presence would make that permanent: the row is already invisible in memory,
+    so a presence check sees nothing to do and skips the commit that is owed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_entity_retry_commits_a_failed_tracking_flush(self, deferred):
+        deferred.entity_chunks.fail_commit_times = 1
+
+        first = await deferred.delete_entity()
+
+        assert first.status == "fail"
+        # In-memory the row is gone; on disk -- what a restart reads -- it is not.
+        assert await deferred.entity_chunks.get_by_id(ENTITY) is None
+        assert ENTITY in deferred.entity_chunks.disk
+
+        second = await deferred.delete_entity()
+
+        assert second.status == "not_found"
+        assert ENTITY not in deferred.entity_chunks.disk
+        assert deferred.entity_chunks.disk[OTHER] == CHUNKS
+
+    @pytest.mark.asyncio
+    async def test_entity_retry_commits_pending_relation_rows(self, deferred):
+        # The incident relation rows are deleted in the same phase; a retry that
+        # only ever considers the entity's own row must still flush them.
+        deferred.relation_chunks.fail_commit_times = 1
+
+        first = await deferred.delete_entity()
+
+        assert first.status == "fail"
+        assert RELATION_KEY in deferred.relation_chunks.disk
+
+        second = await deferred.delete_entity()
+
+        assert second.status == "not_found"
+        assert RELATION_KEY not in deferred.relation_chunks.disk
+
+    @pytest.mark.asyncio
+    async def test_relation_retry_commits_a_failed_tracking_flush(self, deferred):
+        deferred.relation_chunks.fail_commit_times = 1
+
+        first = await deferred.delete_relation()
+
+        assert first.status == "fail"
+        assert await deferred.relation_chunks.get_by_id(RELATION_KEY) is None
+        assert RELATION_KEY in deferred.relation_chunks.disk
+
+        second = await deferred.delete_relation()
+
+        assert second.status == "not_found"
         assert RELATION_KEY not in deferred.relation_chunks.disk

@@ -1504,13 +1504,24 @@ When deleting an entity:
 - Deletes and persists the entity and incident-relation chunk-tracking rows, so recreating the entity does not inherit pre-deletion provenance
 - Maintains knowledge graph integrity
 
-Chunk-tracking rows are removed only after the graph node itself is gone, so a
-backend failure mid-deletion can never leave a live entity without its
-authoritative provenance. The inverse residue — a tracking row whose entity is
-already deleted — is swept by repeating the call: a deletion that reports
-`not_found` still drops a stale row for that entity name. Incident relation rows
-are not reachable once the node is gone, so a failure that strands them is
-logged with the exact storage keys.
+A deletion is staged so that no failure can leave a live entity without its
+authoritative provenance — the state from which a later document purge concludes
+"no remaining sources" and removes an entity other documents still reference.
+The graph object's removal is committed first, on its own; only then are the
+tracking rows deleted and committed; the vector storages are flushed last. This
+holds for any mix of backends, including a deferred graph with an immediate-write
+tracking store, which is why the staging is by *durability* rather than by call
+order.
+
+Every remaining failure state is therefore recoverable, and repeating the
+deletion is always the recovery step:
+
+| Failure point | On-disk result | Recovery |
+| --- | --- | --- |
+| Graph commit | Entity live, rows live | Consistent; retry the deletion |
+| Tracking delete or commit | Entity gone, its row stale | Retry: a deletion reporting `not_found` sweeps a stale row for that name and flushes pending tracking state whether or not a row is still visible in memory |
+| Incident relation rows of an entity deletion | Entity gone, relation rows stale | Not reachable automatically — the node is gone, so its edges are unknowable. Logged with the exact storage keys; delete the relation directly to sweep its row |
+| Vector flush | Entity and rows gone, vector record stale | The rebuildable window this codebase accepts elsewhere; `lightrag-rebuild-vdb` restores it |
 
 ### Delete Relations
 
@@ -1528,9 +1539,9 @@ When deleting a relationship:
 - Deletes and persists its chunk-tracking row regardless of endpoint order, so recreating the relation starts with new provenance
 - Preserves both entity nodes and their other relationships
 
-As with entity deletion, the tracking row is removed after the edge, and
-repeating a deletion that reports `not_found` sweeps a stale row left by an
-earlier partial failure.
+Relation deletion is staged exactly as entity deletion is (see the table above),
+and repeating a deletion that reports `not_found` sweeps a stale row and commits
+tracking state an earlier attempt left pending.
 
 ### Delete by Document ID
 

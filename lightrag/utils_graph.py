@@ -314,8 +314,9 @@ async def _sweep_orphan_tracking_row(
 ) -> bool:
     """Drop a chunk-tracking row whose graph object no longer exists.
 
-    Returns True when a row was found and deleted, so the caller can skip the
-    flush on the common case of nothing to sweep. Presence is tested with a plain
+    Returns True when a row was found and deleted. The caller must flush
+    regardless of that answer — see the call sites: an in-memory row is not the
+    same question as pending durable state. Presence is tested with a plain
     ``is not None`` rather than :func:`has_chunk_tracking_row`: a legacy or
     partial row (``{}``, ``{"count": 0}``) is still stored attribution for an
     object that is gone, and sweeping it is exactly as correct as sweeping a
@@ -394,17 +395,26 @@ async def adelete_by_entity(
                 # An absent node with a surviving tracking row is by definition
                 # an orphan: a previous deletion removed the node but failed
                 # before its tracking row, or an older release never cleaned up
-                # at all. Sweeping it here is what makes the ordering
-                # documented in the docstring converge on retry. Only this
-                # entity's own row can be reached —
-                # the node is gone, so its incident edges are unknowable.
-                swept = await _sweep_orphan_tracking_row(
+                # at all. Sweeping it here is what makes the staging documented
+                # in the docstring converge on retry. Only this entity's own row
+                # can be reached — the node is gone, so its incident edges are
+                # unknowable.
+                await _sweep_orphan_tracking_row(
                     entity_chunks_storage, entity_name, f"entity `{entity_name}`"
                 )
-                if swept:
-                    await _persist_graph_updates(
-                        entity_chunks_storage=entity_chunks_storage
-                    )
+                # Flush whether or not a row was visible. A deferred backend
+                # whose commit failed during an earlier attempt still holds that
+                # delete in memory while the stale row sits on disk, so keying
+                # the flush off in-memory presence would make the failure
+                # permanent: the retry would see nothing and skip the commit
+                # that is exactly what is owed. Both stores are flushed because
+                # the failed attempt may have been an entity deletion that got
+                # as far as its incident relation rows. These callbacks are
+                # dirty-gated, so with nothing pending this costs nothing.
+                await _persist_graph_updates(
+                    entity_chunks_storage=entity_chunks_storage,
+                    relation_chunks_storage=relation_chunks_storage,
+                )
                 return DeletionResult(
                     status="not_found",
                     doc_id=entity_name,
@@ -552,15 +562,17 @@ async def adelete_by_relation(
             if not edge_exists:
                 message = f"Relation from '{source_entity}' to '{target_entity}' does not exist"
                 logger.warning(message)
-                swept = await _sweep_orphan_tracking_row(
+                await _sweep_orphan_tracking_row(
                     relation_chunks_storage,
                     storage_key,
                     f"relation `{normalized_src}`~`{normalized_tgt}`",
                 )
-                if swept:
-                    await _persist_graph_updates(
-                        relation_chunks_storage=relation_chunks_storage
-                    )
+                # Unconditional for the same reason as in adelete_by_entity: a
+                # retry must be able to commit a delete an earlier attempt left
+                # pending in memory.
+                await _persist_graph_updates(
+                    relation_chunks_storage=relation_chunks_storage
+                )
                 return DeletionResult(
                     status="not_found",
                     doc_id=relation_str,
