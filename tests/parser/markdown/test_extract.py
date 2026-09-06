@@ -22,6 +22,9 @@ from lightrag.parser.markdown.extract import (
 )
 
 
+pytestmark = pytest.mark.offline
+
+
 _LEGACY_INLINE_IMAGE_RE = re.compile(
     r'!\[(?P<alt>[^\]]*)\]\(\s*(?P<src><[^>]*>|[^)\s]+)(?:\s+"[^"]*")?\s*\)'
 )
@@ -373,17 +376,17 @@ def test_html_table_outer_close_tag_split_by_whitespace_across_lines():
     assert ex.blocks[0]["content"].endswith(" tail")
 
 
-def test_html_table_ignores_comment_marker_inside_title():
+@pytest.mark.parametrize("tag", ["textarea", "title"])
+def test_html_table_ignores_comment_marker_inside_rcdata(tag: str):
     """RCDATA content must not be scanned for HTML comments either -- a
-    literal <!-- inside <title> text must stay literal, not open a
-    (never-closing) comment state."""
+    literal <!-- must stay text rather than open a never-closing comment."""
     ex = _extract(
-        "<table><tr><td><title>a <!-- not a comment</title></td></tr></table> tail"
+        f"<table><tr><td><{tag}>a <!-- not a comment</{tag}></td></tr></table> tail"
     )
 
     (table,) = ex.tables.values()
     assert table["html"].endswith("</table>")
-    assert "<!-- not a comment</title>" in table["html"]
+    assert f"<!-- not a comment</{tag}>" in table["html"]
     assert ex.blocks[0]["content"].endswith(" tail")
 
 

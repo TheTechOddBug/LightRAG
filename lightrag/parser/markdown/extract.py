@@ -546,11 +546,19 @@ class _HTMLTableBoundaryFinder(HTMLParser):
     """Tracks ``<table>`` nesting depth to find the matching outer close.
 
     All actual HTML tokenization -- quoted attributes, comments, CDATA,
-    RCDATA/raw-text elements (``script``/``style``/``textarea``/``title``),
-    tag-name rules -- is delegated to the standard library's tokenizer
-    instead of being re-implemented by hand. This class only watches the
-    ``table`` start/end tag events it already reports correctly.
+    RCDATA/raw-text elements, tag-name rules -- is delegated to the standard
+    library's tokenizer instead of being re-implemented by hand. This class
+    only watches the ``table`` start/end tag events it already reports
+    correctly.
     """
+
+    # HTMLParser's version-dependent raw-text compatibility list omits the
+    # RCDATA elements textarea/title. Without adding them, a literal "<!--"
+    # inside either element starts an HTML comment that can hide </table>.
+    CDATA_CONTENT_ELEMENTS = HTMLParser.CDATA_CONTENT_ELEMENTS + (
+        "textarea",
+        "title",
+    )
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=False)
