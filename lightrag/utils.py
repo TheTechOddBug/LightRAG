@@ -5378,7 +5378,8 @@ def sanitize_and_normalize_extracted_text(
         remove_inner_quotes: whether to remove Chinese quotation marks and
             English quotation marks adjacent to Chinese characters, and to
             normalize non-breaking spaces. Matching outer quotation marks are
-            removed regardless of this option.
+            removed independently of this option only when the enclosed text
+            contains no corresponding quote characters.
 
     Returns:
         Sanitized and normalized text string
@@ -5406,7 +5407,8 @@ def normalize_extracted_info(name: str, remove_inner_quotes=False) -> str:
     - Preserve spaces within English text and numbers
     - Replace Chinese parentheses with English parentheses
     - Replace Chinese dash with English dash
-    - Remove matching outer English/Chinese quotation marks or book title marks
+    - Remove a matching outer English/Chinese quote or book title mark pair only
+      when the enclosed text contains no corresponding mark characters
     - Filter out short numeric-only text (length < 3 and only digits/dots)
     - remove_inner_quotes = True
         - Remove Chinese quotation marks
@@ -5418,7 +5420,8 @@ def normalize_extracted_info(name: str, remove_inner_quotes=False) -> str:
         name: Entity name to normalize
         remove_inner_quotes: whether to apply the optional quote and
             non-breaking-space rules above. Matching outer quotation marks are
-            removed regardless of this option.
+            removed independently of this option only when the enclosed text
+            contains no corresponding quote characters.
 
     Returns:
         Normalized entity name
