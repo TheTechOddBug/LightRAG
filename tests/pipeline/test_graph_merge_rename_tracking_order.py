@@ -75,6 +75,12 @@ class _KVStorage:
         self.records.update(data)
 
     async def delete(self, ids):
+        # Yield before recording anything: a real RPC-backed store round-trips
+        # here, so this is the suspension point at which a pending cancellation
+        # is delivered. Without it the double would swallow every cancellation
+        # aimed at the retirement step and `TestCancellationDoesNotStrandRows`
+        # could not tell a protected cleanup from an unprotected one.
+        await asyncio.sleep(0)
         self.timeline.append(("delete", self.tag, sorted(ids)))
         for key in ids:
             self.records.pop(key, None)
@@ -169,6 +175,25 @@ class _Fixture:
             return result
 
         monkeypatch.setattr(self.graph, "index_done_callback", _logged)
+
+    def cancel_caller_on_graph_commit(self, monkeypatch, caller, *, after: int = 0):
+        """Cancel ``caller`` from inside a graph commit that really landed.
+
+        Models the shutdown case: the commit finishes, and the cancellation is
+        delivered to the task that requested the merge/rename while its tracking
+        cleanup is still owed.
+        """
+        original = self.graph.index_done_callback
+        calls = {"n": 0}
+
+        async def _commit():
+            result = await original()
+            calls["n"] += 1
+            if calls["n"] > after:
+                caller.cancel()
+            return result
+
+        monkeypatch.setattr(self.graph, "index_done_callback", _commit)
 
     def fail_graph_commit(self, monkeypatch, *, after: int = 0, declined: bool = False):
         original = self.graph.index_done_callback
@@ -366,6 +391,55 @@ class TestUpsertStillPrecedesDelete:
         assert rag.entity_chunks.records[RENAMED] == CHUNKS
         assert rag.relation_chunks.records[make_relation_chunk_key(RENAMED, OTHER)]
         assert rag.entity_chunks.records[SOURCE] == CHUNKS
+
+
+class TestCancellationDoesNotStrandRows:
+    """A cancellation delivered after the commit must not skip the retirement.
+
+    Once the commit lands, the old node/edges are gone for good and their
+    tracking rows describe nothing. `CancelledError` is a `BaseException`, so it
+    slips past every `except Exception` on the way out and, unprotected, returns
+    with the rows still on disk. For an entity that residue is unreachable: the
+    incident relation keys cannot be rediscovered once the node is gone, so a
+    later recreation of the same key reads a stale row back as authoritative
+    provenance. Both paths therefore run the commit and the retirement inside
+    one cancellation-deferring region, exactly as `adelete_by_entity` does.
+
+    The caller is cancelled from inside a commit that really succeeded, which is
+    the shutdown case this protects: `commit_in_storage_io` finishes the GraphML
+    write before re-raising, so the cancellation surfaces with the cleanup owed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_merge_retires_rows_even_when_the_caller_is_cancelled(
+        self, rag, monkeypatch
+    ):
+        # after=1: the merge commits twice (the merged target, then the source
+        # removal). Only the second one leaves rows owed.
+        rag.cancel_caller_on_graph_commit(monkeypatch, asyncio.current_task(), after=1)
+
+        with pytest.raises(asyncio.CancelledError):
+            await rag.merge()
+
+        assert SOURCE not in rag.persisted_graph().nodes()
+        assert SOURCE not in rag.entity_chunks.records
+        assert make_relation_chunk_key(SOURCE, OTHER) not in rag.relation_chunks.records
+        assert _live_objects_without_rows(rag) == []
+
+    @pytest.mark.asyncio
+    async def test_rename_retires_rows_even_when_the_caller_is_cancelled(
+        self, rag, monkeypatch
+    ):
+        rag.cancel_caller_on_graph_commit(monkeypatch, asyncio.current_task())
+
+        with pytest.raises(asyncio.CancelledError):
+            await rag.rename()
+
+        assert SOURCE not in rag.persisted_graph().nodes()
+        assert SOURCE not in rag.entity_chunks.records
+        assert make_relation_chunk_key(SOURCE, OTHER) not in rag.relation_chunks.records
+        assert rag.entity_chunks.records[RENAMED] == CHUNKS
+        assert _live_objects_without_rows(rag) == []
 
 
 class TestMergingEntitiesWithoutRelations:

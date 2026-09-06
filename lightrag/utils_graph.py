@@ -1057,16 +1057,38 @@ async def _edit_entity_impl(
     # is the fix for the opposite failure (#3609), where a crash left the row
     # under neither key. An orphaned new-key row is dead bookkeeping a retry
     # overwrites; a live object with no row is the bug.
-    await _commit_graph_or_raise(
-        chunk_entity_relation_graph, f"Entity Edit: `{original_entity_name}`"
-    )
+    async def _commit_rename_and_retire_tracking() -> None:
+        await _commit_graph_or_raise(
+            chunk_entity_relation_graph, f"Entity Edit: `{original_entity_name}`"
+        )
 
-    for storage, key in tracking_keys_to_retire:
-        await storage.delete([key])
+        for storage, key in tracking_keys_to_retire:
+            try:
+                await storage.delete([key])
+            except Exception:
+                logger.error(
+                    "Entity Edit: failed to retire chunk tracking after renaming "
+                    f"`{original_entity_name}`; these rows are now orphaned: "
+                    f"{[k for _, k in tracking_keys_to_retire]}"
+                )
+                raise
 
-    await _persist_graph_updates(
-        entity_chunks_storage=entity_chunks_storage,
-        relation_chunks_storage=relation_chunks_storage,
+        # Flushed inside the region: on a deferred KV backend the deletes above
+        # only touch memory, so a cancellation delivered before this flush would
+        # leave the retired rows on disk -- the orphan the region prevents.
+        await _persist_graph_updates(
+            entity_chunks_storage=entity_chunks_storage,
+            relation_chunks_storage=relation_chunks_storage,
+        )
+
+    # One cancellation-deferring region, as in adelete_by_entity: after the
+    # commit the old node is gone for good, so its rows describe nothing and the
+    # cleanup is owed; a cancellation delivered mid-cleanup would strand them.
+    # The region starts before the commit because that await is itself where a
+    # deferred cancellation reappears.
+    await _finish_deferring_cancellation(
+        _commit_rename_and_retire_tracking(),
+        f"Entity Edit: `{original_entity_name}` graph and tracking cleanup",
     )
     # Vector stores last: their residue is the rebuildable window this codebase
     # accepts elsewhere, and bundling them earlier would let a vector failure
@@ -2527,32 +2549,73 @@ async def _merge_entities_impl(
     # overwritten by a retry; a row that is absent while its object lives is the
     # bug. Both invariants hold with the upserts before the commit and the
     # deletes after it.
-    try:
-        await _commit_graph_or_raise(
-            chunk_entity_relation_graph,
-            f"Entity Merge: removing sources merged into '{target_entity}'",
-        )
-    except Exception as e:
-        raise VectorStorageConsistencyError(
-            f"Persisting the source-entity removal failed while finalizing the merge "
-            f"into '{target_entity}': {e}. The merged relations are already on disk, "
-            "but the source entities were NOT removed and still carry their chunk "
-            "tracking, so nothing has lost its provenance. Retry the merge; it is "
-            "idempotent from this state."
-        ) from e
+    async def _commit_source_removal_and_retire_tracking() -> None:
+        try:
+            await _commit_graph_or_raise(
+                chunk_entity_relation_graph,
+                f"Entity Merge: removing sources merged into '{target_entity}'",
+            )
+        except Exception as e:
+            raise VectorStorageConsistencyError(
+                f"Persisting the source-entity removal failed while finalizing the merge "
+                f"into '{target_entity}': {e}. The merged relations are already on disk, "
+                "but the source entities were NOT removed and still carry their chunk "
+                "tracking, so nothing has lost its provenance. Retry the merge; it is "
+                "idempotent from this state."
+            ) from e
 
-    if relation_chunks_storage is not None and stale_relation_keys:
-        await relation_chunks_storage.delete(stale_relation_keys)
-    if entity_chunks_storage is not None and entity_keys_to_delete:
-        await entity_chunks_storage.delete(entity_keys_to_delete)
+        if relation_chunks_storage is not None and stale_relation_keys:
+            try:
+                await relation_chunks_storage.delete(stale_relation_keys)
+            except Exception:
+                logger.error(
+                    "Entity Merge: failed to retire relation chunk tracking; "
+                    f"these rows are now orphaned: {stale_relation_keys}"
+                )
+                raise
+        if entity_chunks_storage is not None and entity_keys_to_delete:
+            try:
+                await entity_chunks_storage.delete(entity_keys_to_delete)
+            except Exception:
+                logger.error(
+                    "Entity Merge: failed to retire entity chunk tracking; "
+                    f"these rows are now orphaned: {entity_keys_to_delete}"
+                )
+                raise
 
-    # 11. Save changes. The graph is already committed above, so flushing it
-    # again here would rewrite the whole file for nothing.
+        # Flushed inside the region, not after it: on a deferred KV backend the
+        # deletes above only touch memory, so a cancellation delivered between
+        # them and this flush would leave the retired rows on disk -- exactly
+        # the orphan the region exists to prevent.
+        try:
+            await _persist_graph_updates(
+                entity_chunks_storage=entity_chunks_storage,
+                relation_chunks_storage=relation_chunks_storage,
+            )
+        except Exception as e:
+            raise VectorStorageConsistencyError(
+                f"Persisting the retired chunk tracking failed while finalizing the "
+                f"merge into '{target_entity}': {e}. The merge has been applied to the "
+                "knowledge graph (the authoritative source) and the source entities "
+                "were removed, but their chunk tracking rows may survive as orphans. "
+                "No data is lost; the stale rows are dead bookkeeping."
+            ) from e
+
+    # The source removal, its durable commit and the tracking retirement are one
+    # cancellation-deferring region, for the same reason as adelete_by_entity:
+    # once the commit lands, the tracking rows describe objects that no longer
+    # exist, and a cancellation delivered mid-cleanup would strand them. The
+    # commit await is itself where a deferred cancellation reappears, so the
+    # region has to start before it -- protecting only the deletes would mean
+    # never reaching them.
+    await _finish_deferring_cancellation(
+        _commit_source_removal_and_retire_tracking(),
+        f"Entity Merge: source removal and tracking cleanup for '{target_entity}'",
+    )
+
+    # 11. Save the vector storages. The graph is already committed above, so
+    # flushing it again here would rewrite the whole file for nothing.
     try:
-        await _persist_graph_updates(
-            entity_chunks_storage=entity_chunks_storage,
-            relation_chunks_storage=relation_chunks_storage,
-        )
         await _persist_graph_updates(
             entities_vdb=entities_vdb,
             relationships_vdb=relationships_vdb,
@@ -2562,8 +2625,8 @@ async def _merge_entities_impl(
             f"Persisting the merged state failed while finalizing the merge into "
             f"'{target_entity}': {e}. The merge has been applied to the knowledge graph "
             "(the authoritative source) and the source entities were removed, but the "
-            "chunk tracking or vector storage may not be fully persisted, so they may "
-            "now be inconsistent. No data is lost. Stop the LightRAG server and run the "
+            "vector storage may not be fully persisted, so they may now be "
+            "inconsistent. No data is lost. Stop the LightRAG server and run the "
             "offline rebuild tool (lightrag-rebuild-vdb) to restore consistency."
         ) from e
 
