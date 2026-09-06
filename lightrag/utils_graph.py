@@ -2544,7 +2544,10 @@ async def _merge_entities_impl(
                 f"failed while finalizing the merge into '{target_entity}': {e}. "
                 "The source entities were NOT removed from the knowledge graph (the "
                 "authoritative source) and still carry their chunk tracking, so no "
-                "data is lost and nothing has lost its provenance. Retry the merge."
+                "data is lost and nothing has lost its provenance; retrying the "
+                "merge is safe. Vector records deleted before this failure leave "
+                "those entities with no embedding until the merge is retried or the "
+                "offline rebuild tool (lightrag-rebuild-vdb) is run."
             ) from e
 
     # 10b. Make the source entities' removal durable, and only then retire the
