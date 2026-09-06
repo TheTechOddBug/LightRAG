@@ -10,6 +10,8 @@ from .constants import GRAPH_FIELD_SEP, RELATION_NO_EVIDENCE_SOURCE_IDS
 from .operate import _truncate_vdb_content
 from .utils import (
     VectorStorageConsistencyError,
+    _consume_future_exception,
+    _wait_deferring_cancellation,
     compute_mdhash_id,
     graph_attribute_value_rejection,
     logger,
@@ -309,6 +311,40 @@ async def _persist_graph_updates(
         )
 
 
+async def _finish_deferring_cancellation(coro, description: str) -> None:
+    """Run ``coro`` to completion even if this task is cancelled meanwhile.
+
+    Cancellation can arrive *after* the graph commit has already landed:
+    ``commit_in_storage_io`` deliberately finishes the GraphML write and its
+    commit hook before re-raising ``CancelledError``, and ``CancelledError`` is a
+    ``BaseException``, so the deletion helpers' ``except Exception`` does not see
+    it either. Returning there would leave the object durably gone with its
+    tracking rows intact — and for an entity the incident relation rows are then
+    unreachable by the ``not_found`` sweep, so a recreated relation would read
+    them back as authoritative provenance: exactly the defect this module exists
+    to prevent, and with no audit line, since the code that logs the stranded
+    keys never runs.
+
+    Loop-and-shield rather than a bare ``asyncio.shield``: a second cancel would
+    let the caller escape while the cleanup is still running. Same idiom, and
+    same reason, as ``_bounded_submit_impl``'s own deferred commit hook.
+    """
+    future = asyncio.ensure_future(coro)
+    future.add_done_callback(_consume_future_exception)
+    pending_cancel = await _wait_deferring_cancellation(future, None)
+    error = None if future.cancelled() else future.exception()
+    if pending_cancel is not None:
+        if error is not None:
+            # The caller is about to get CancelledError, so this is the only
+            # place this failure can still be seen.
+            logger.error(
+                f"{description} failed while its caller was cancelled: {error}"
+            )
+        raise pending_cancel
+    if error is not None:
+        raise error
+
+
 async def _commit_graph_or_raise(chunk_entity_relation_graph, context: str) -> None:
     """Commit the graph, and refuse to continue unless it actually persisted.
 
@@ -483,29 +519,37 @@ async def adelete_by_entity(
             # not_found sweep, while an orphaned relation row is not once the
             # node is deleted, so the unrecoverable step takes the earliest slot
             # and names its keys in the log if it fails.
-            if relation_keys_to_delete:
-                try:
-                    await relation_chunks_storage.delete(relation_keys_to_delete)
-                except Exception:
-                    logger.error(
-                        "Entity Delete: failed to remove relation chunk tracking; "
-                        f"these rows are now orphaned: {relation_keys_to_delete}"
+            async def _drop_entity_tracking() -> None:
+                if relation_keys_to_delete:
+                    try:
+                        await relation_chunks_storage.delete(relation_keys_to_delete)
+                    except Exception:
+                        logger.error(
+                            "Entity Delete: failed to remove relation chunk tracking; "
+                            f"these rows are now orphaned: {relation_keys_to_delete}"
+                        )
+                        raise
+                    logger.info(
+                        f"Entity Delete: removed chunk tracking for {len(relation_keys_to_delete)} relations"
                     )
-                    raise
-                logger.info(
-                    f"Entity Delete: removed chunk tracking for {len(relation_keys_to_delete)} relations"
+
+                if entity_chunks_storage is not None:
+                    # Delete entity's entry from entity_chunks_storage
+                    await entity_chunks_storage.delete([entity_name])
+                    logger.info(
+                        f"Entity Delete: removed chunk tracking for `{entity_name}`"
+                    )
+
+                await _persist_graph_updates(
+                    entity_chunks_storage=entity_chunks_storage,
+                    relation_chunks_storage=relation_chunks_storage,
                 )
 
-            if entity_chunks_storage is not None:
-                # Delete entity's entry from entity_chunks_storage
-                await entity_chunks_storage.delete([entity_name])
-                logger.info(
-                    f"Entity Delete: removed chunk tracking for `{entity_name}`"
-                )
-
-            await _persist_graph_updates(
-                entity_chunks_storage=entity_chunks_storage,
-                relation_chunks_storage=relation_chunks_storage,
+            # Past the commit above this cleanup is owed, so a cancellation must
+            # not skip it — see _finish_deferring_cancellation.
+            await _finish_deferring_cancellation(
+                _drop_entity_tracking(),
+                f"Entity Delete: '{entity_name}' tracking cleanup",
             )
 
             # PHASE 3 — vector stores last. Bundling their flush with the graph
@@ -625,13 +669,20 @@ async def adelete_by_relation(
                 f"Relation Delete: `{source_entity}`~`{target_entity}`",
             )
 
-            if relation_chunks_storage is not None:
-                await relation_chunks_storage.delete([storage_key])
-                logger.info(
-                    f"Relation Delete: removed chunk tracking for `{source_entity}`~`{target_entity}`"
+            async def _drop_relation_tracking() -> None:
+                if relation_chunks_storage is not None:
+                    await relation_chunks_storage.delete([storage_key])
+                    logger.info(
+                        f"Relation Delete: removed chunk tracking for `{source_entity}`~`{target_entity}`"
+                    )
+                await _persist_graph_updates(
+                    relation_chunks_storage=relation_chunks_storage,
                 )
-            await _persist_graph_updates(
-                relation_chunks_storage=relation_chunks_storage,
+
+            # Owed past the commit, cancellation included — see the entity path.
+            await _finish_deferring_cancellation(
+                _drop_relation_tracking(),
+                f"Relation Delete: `{source_entity}`~`{target_entity}` tracking cleanup",
             )
 
             await _persist_graph_updates(relationships_vdb=relationships_vdb)

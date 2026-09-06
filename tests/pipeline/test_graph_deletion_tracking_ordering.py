@@ -34,6 +34,7 @@ for either group here.
 
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 
 import pytest
@@ -64,7 +65,12 @@ class _Boom(RuntimeError):
 
 
 class _KVStorage:
-    """Immediate-write KV double: `delete` takes effect before the next await."""
+    """Immediate-write KV double: `delete` takes effect before the next await.
+
+    Every method yields once before doing its work, the way a real async backend
+    suspends on I/O. Without that a pending cancellation is never delivered
+    inside this code and the cancellation cases below would prove nothing.
+    """
 
     def __init__(self):
         self.records: dict = {}
@@ -78,6 +84,7 @@ class _KVStorage:
         self.records.update(deepcopy(data))
 
     async def delete(self, ids):
+        await asyncio.sleep(0)
         if self.fail_delete_times > 0:
             self.fail_delete_times -= 1
             raise _Boom("tracking delete failed")
@@ -85,6 +92,7 @@ class _KVStorage:
             self.records.pop(key, None)
 
     async def index_done_callback(self):
+        await asyncio.sleep(0)
         self.flushes += 1
 
 
@@ -109,6 +117,7 @@ class _VectorStorage:
         self._check()
 
     async def index_done_callback(self):
+        await asyncio.sleep(0)
         self.flushes += 1
         if self.fail_flush:
             raise _Boom("vector flush failed")
@@ -299,10 +308,12 @@ class _DeferredKVStorage:
         self.records.update(deepcopy(data))
 
     async def delete(self, ids):
+        await asyncio.sleep(0)
         for key in ids:
             self.records.pop(key, None)
 
     async def index_done_callback(self):
+        await asyncio.sleep(0)
         self.commit_log.append(self.name)
         if self.fail_commit_times > 0:
             self.fail_commit_times -= 1
@@ -644,5 +655,56 @@ class TestFailedGraphSaveDoesNotStrandProvenance:
         second = await rag.delete_relation()
 
         assert second.status == "success"
+        assert not rag.persisted_graph().has_edge(ENTITY, OTHER)
+        assert RELATION_KEY not in rag.relation_chunks.records
+
+
+class TestCancellationAfterTheCommit:
+    """A cancel landing past the graph commit must not skip the cleanup.
+
+    `commit_in_storage_io` deliberately finishes the GraphML write and its commit
+    hook before re-raising `CancelledError`, and `CancelledError` is a
+    `BaseException`, so the helpers' `except Exception` never sees it. Returning
+    at that point leaves the object durably gone with its tracking rows intact --
+    and for an entity the incident relation rows are then unreachable by the
+    not_found sweep, so recreating that relation inherits the pre-deletion chunk
+    ids with no audit line anywhere.
+    """
+
+    @staticmethod
+    def _cancel_right_after_commit(fixture, monkeypatch):
+        original = fixture.graph.index_done_callback
+
+        async def _commit_then_cancel():
+            result = await original()
+            asyncio.current_task().cancel()
+            return result
+
+        monkeypatch.setattr(fixture.graph, "index_done_callback", _commit_then_cancel)
+
+    @pytest.mark.asyncio
+    async def test_entity_tracking_is_cleaned_despite_the_cancel(
+        self, rag, monkeypatch
+    ):
+        self._cancel_right_after_commit(rag, monkeypatch)
+
+        with pytest.raises(asyncio.CancelledError):
+            await rag.delete_entity()
+
+        # The node is durably gone, so every row it owned must be gone too.
+        assert not rag.persisted_graph().has_node(ENTITY)
+        assert ENTITY not in rag.entity_chunks.records
+        assert RELATION_KEY not in rag.relation_chunks.records
+        assert rag.entity_chunks.records[OTHER] == CHUNKS
+
+    @pytest.mark.asyncio
+    async def test_relation_tracking_is_cleaned_despite_the_cancel(
+        self, rag, monkeypatch
+    ):
+        self._cancel_right_after_commit(rag, monkeypatch)
+
+        with pytest.raises(asyncio.CancelledError):
+            await rag.delete_relation()
+
         assert not rag.persisted_graph().has_edge(ENTITY, OTHER)
         assert RELATION_KEY not in rag.relation_chunks.records
