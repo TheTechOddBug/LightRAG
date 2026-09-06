@@ -17,11 +17,19 @@ pre-fix ordering (the row is gone), not by importing a symbol the fix adds.
 object is already gone -- and pins that a repeat deletion sweeps it, which is what
 makes a partial failure recoverable instead of permanent.
 
-The doubles here are deliberately immediate-write: on the JSON/NetworkX/Nano stack
-used by tests/pipeline/test_graph_deletion_tracking.py every step is an in-memory
-mutation that only reaches disk in `index_done_callback`, so an exception midway
-persists nothing and BOTH orderings look identical. This ordering only bites on
-backends that write on call (Redis/PG/Mongo KV, Neo4j/PG graph).
+`TestDurableCommitOrdering` covers the second half of the same invariant. On the
+deferred backends the calls above are all in-memory and `index_done_callback` is
+the only durable commit, so sequencing the *calls* proves nothing there: flushing
+every store in one `asyncio.gather` leaves the durable order unconstrained, and a
+failed GraphML commit next to a successful tracking commit puts the forbidden
+state on disk. The flush is therefore split into two ordered phases.
+
+The doubles are deliberately split by write timing, because the two halves of the
+invariant fail on different backends: immediate-write (Redis/PG/Mongo KV, Neo4j/PG
+graph) for the call ordering, deferred-commit (NetworkX/JSON) for the flush
+ordering. tests/pipeline/test_graph_deletion_tracking.py runs the real deferred
+stack and is green under every ordering, which is exactly why it cannot stand in
+for either group here.
 """
 
 from __future__ import annotations
@@ -259,3 +267,104 @@ class TestOrphanRowsConverge:
 
         assert result.status == "not_found"
         assert "GHOST" not in rag.entity_chunks.records
+
+
+class _DeferredKVStorage:
+    """Deferred-commit KV double: `delete` is in-memory, `index_done_callback` commits."""
+
+    def __init__(self, name: str, commit_log: list[str]):
+        self.name = name
+        self.commit_log = commit_log
+        self.records: dict = {}
+        self.disk: dict = {}
+
+    async def get_by_id(self, key):
+        return deepcopy(self.records.get(key))
+
+    async def upsert(self, data):
+        self.records.update(deepcopy(data))
+
+    async def delete(self, ids):
+        for key in ids:
+            self.records.pop(key, None)
+
+    async def index_done_callback(self):
+        self.commit_log.append(self.name)
+        self.disk = deepcopy(self.records)
+
+
+@pytest.fixture
+async def deferred(tmp_path):
+    """Real NetworkX graph plus deferred-commit tracking doubles."""
+    fixture = _Fixture(tmp_path)
+    fixture.commit_log: list[str] = []
+    fixture.entity_chunks = _DeferredKVStorage("entity_chunks", fixture.commit_log)
+    fixture.relation_chunks = _DeferredKVStorage("relation_chunks", fixture.commit_log)
+    await fixture.start()
+    # Seed the committed baseline: this is what a restart would read back.
+    await fixture.entity_chunks.index_done_callback()
+    await fixture.relation_chunks.index_done_callback()
+    fixture.commit_log.clear()
+    yield fixture
+    await fixture.graph.finalize()
+
+
+def _log_graph_commit(fixture, monkeypatch, *, fail: bool):
+    original = fixture.graph.index_done_callback
+
+    async def _commit():
+        fixture.commit_log.append("graph")
+        if fail:
+            raise _Boom("graph commit failed")
+        return await original()
+
+    monkeypatch.setattr(fixture.graph, "index_done_callback", _commit)
+
+
+class TestDurableCommitOrdering:
+    """The graph must reach disk before the tracking rows do."""
+
+    @pytest.mark.asyncio
+    async def test_entity_graph_commit_failure_keeps_rows_on_disk(
+        self, deferred, monkeypatch
+    ):
+        _log_graph_commit(deferred, monkeypatch, fail=True)
+
+        result = await deferred.delete_entity()
+
+        assert result.status == "fail"
+        # The graph never committed, so on restart the entity is still live --
+        # its tracking rows must still be on disk with it.
+        assert deferred.entity_chunks.disk[ENTITY] == CHUNKS
+        assert deferred.relation_chunks.disk[RELATION_KEY] == CHUNKS
+        assert deferred.commit_log == ["graph"]
+
+    @pytest.mark.asyncio
+    async def test_relation_graph_commit_failure_keeps_row_on_disk(
+        self, deferred, monkeypatch
+    ):
+        _log_graph_commit(deferred, monkeypatch, fail=True)
+
+        result = await deferred.delete_relation()
+
+        assert result.status == "fail"
+        assert deferred.relation_chunks.disk[RELATION_KEY] == CHUNKS
+        assert deferred.commit_log == ["graph"]
+
+    @pytest.mark.asyncio
+    async def test_successful_entity_delete_commits_graph_first(
+        self, deferred, monkeypatch
+    ):
+        # Stability, not a fix proof: a single gather also happens to start the
+        # graph commit first, so only the two failure cases above go red on the
+        # unordered flush. This one pins the happy-path order against a future
+        # reshuffle of the phases.
+        _log_graph_commit(deferred, monkeypatch, fail=False)
+
+        result = await deferred.delete_entity()
+
+        assert result.status == "success"
+        assert deferred.commit_log[0] == "graph"
+        assert set(deferred.commit_log[1:]) == {"entity_chunks", "relation_chunks"}
+        assert ENTITY not in deferred.entity_chunks.disk
+        assert RELATION_KEY not in deferred.relation_chunks.disk

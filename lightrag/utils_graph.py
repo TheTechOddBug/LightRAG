@@ -357,6 +357,11 @@ async def adelete_by_entity(
     strictly milder: an orphan tracking row whose object is already gone, which
     the ``not_found`` sweep below converges on retry.
 
+    The ordering is enforced at the DURABLE level, not just the call level: the
+    deferred backends (NetworkX/JSON) only commit in ``index_done_callback``, so
+    the flush is split into two sequential phases — graph and vectors first,
+    tracking rows second — instead of one concurrent ``asyncio.gather``.
+
     Args:
         chunk_entity_relation_graph: Graph storage instance
         entities_vdb: Vector database storage for entities
@@ -447,10 +452,22 @@ async def adelete_by_entity(
 
             message = f"Entity Delete: remove '{entity_name}' and its {related_relations_count} relations"
             logger.info(message)
+            # Two ordered commit phases, not one gather. On the deferred
+            # backends (NetworkX/JSON) every delete above is an in-memory
+            # mutation and index_done_callback is the only durable commit, so
+            # flushing the graph and the tracking stores concurrently leaves the
+            # DURABLE order unconstrained: a failed GraphML commit next to a
+            # successful tracking commit reproduces on disk exactly the state
+            # this ordering exists to prevent — a live entity with no tracking
+            # row. Committing the graph first puts durability under the same
+            # rule as the in-memory sequence; a failure now aborts before the
+            # tracking commit, leaving the row intact.
             await _persist_graph_updates(
                 entities_vdb=entities_vdb,
                 relationships_vdb=relationships_vdb,
                 chunk_entity_relation_graph=chunk_entity_relation_graph,
+            )
+            await _persist_graph_updates(
                 entity_chunks_storage=entity_chunks_storage,
                 relation_chunks_storage=relation_chunks_storage,
             )
@@ -560,9 +577,14 @@ async def adelete_by_relation(
 
             message = f"Relation Delete: `{source_entity}`~`{target_entity}` deleted successfully"
             logger.info(message)
+            # Commit the edge removal before the tracking row — see the ordered
+            # two-phase commit in adelete_by_entity for why one gather is not
+            # enough on deferred backends.
             await _persist_graph_updates(
                 relationships_vdb=relationships_vdb,
                 chunk_entity_relation_graph=chunk_entity_relation_graph,
+            )
+            await _persist_graph_updates(
                 relation_chunks_storage=relation_chunks_storage,
             )
             return DeletionResult(
