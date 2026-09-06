@@ -8,7 +8,7 @@ from uuid import uuid4
 import numpy as np
 import pytest
 
-from lightrag import LightRAG
+from lightrag import LightRAG, utils_graph
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.utils import EmbeddingFunc, Tokenizer, make_relation_chunk_key
 
@@ -159,3 +159,132 @@ async def test_delete_removes_tracking_before_reinsert(
             ]
     finally:
         await rag.finalize_storages()
+
+
+@pytest.fixture
+async def creation_rag(tmp_path):
+    rag = LightRAG(
+        working_dir=str(tmp_path),
+        workspace=f"creation_{uuid4().hex}",
+        llm_model_func=_no_llm,
+        embedding_func=EmbeddingFunc(embedding_dim=8, func=_embed),
+        tokenizer=Tokenizer("characters", _Characters()),
+        max_parallel_insert=1,
+    )
+    await rag.initialize_storages()
+    rag._process_extract_entities = _extract
+    try:
+        yield rag
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["sdk", "helper"])
+@pytest.mark.parametrize("kind", ["entity", "relation"])
+@pytest.mark.parametrize(
+    "source_id,expected",
+    [
+        (None, []),
+        ("", []),
+        ("manual_creation", []),
+        ("UNKNOWN", []),
+        (
+            GRAPH_FIELD_SEP.join(
+                ["manual_creation", "chunk-new", "UNKNOWN", "", "chunk-new", "chunk-2"]
+            ),
+            ["chunk-new", "chunk-2"],
+        ),
+    ],
+)
+async def test_explicit_creation_replaces_orphan_evidence(
+    creation_rag, monkeypatch, kind, source_id, expected, entrypoint
+):
+    rag = creation_rag
+    await rag.ainsert("Atlas and Borealis: old harbor", ids=["old"])
+    tracking = rag.entity_chunks if kind == "entity" else rag.relation_chunks
+    key = "Atlas" if kind == "entity" else make_relation_chunk_key("Atlas", "Borealis")
+    old_row = await tracking.get_by_id(key)
+    assert old_row["chunk_ids"]
+
+    # Real JSON storage: a failed cleanup leaves durable orphan evidence after
+    # graph deletion. Explicit creation must replace it, even without sources.
+    async def fail_cleanup(ids):
+        raise OSError("injected tracking cleanup failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(tracking, "delete", fail_cleanup)
+        result = (
+            await rag.adelete_by_entity("Atlas")
+            if kind == "entity"
+            else await rag.adelete_by_relation("Atlas", "Borealis")
+        )
+    assert result.status == "fail"
+    assert (
+        json.loads(Path(tracking._file_name).read_text())[key]["chunk_ids"]
+        == old_row["chunk_ids"]
+    )
+
+    data = {"description": "Manually recreated"}
+    if source_id is not None:
+        data["source_id"] = source_id
+    if kind == "entity":
+        if entrypoint == "sdk":
+            await rag.acreate_entity("Atlas", data)
+        else:
+            await utils_graph.acreate_entity(
+                rag.chunk_entity_relation_graph,
+                rag.entities_vdb,
+                rag.relationships_vdb,
+                "Atlas",
+                data,
+                entity_chunks_storage=rag.entity_chunks,
+            )
+    else:
+        data["weight"] = max(1, len(expected))
+        if entrypoint == "sdk":
+            await rag.acreate_relation("Atlas", "Borealis", data)
+        else:
+            await utils_graph.acreate_relation(
+                rag.chunk_entity_relation_graph,
+                rag.entities_vdb,
+                rag.relationships_vdb,
+                "Atlas",
+                "Borealis",
+                data,
+                relation_chunks_storage=rag.relation_chunks,
+            )
+
+    row = await tracking.get_by_id(key)
+    assert row["chunk_ids"] == expected
+    assert row["count"] == len(expected)
+    persisted = json.loads(Path(tracking._file_name).read_text())[key]
+    assert persisted["chunk_ids"] == expected
+    assert persisted["count"] == len(expected)
+
+
+@pytest.mark.asyncio
+async def test_manual_entity_then_document_is_deleted_without_rebuild(
+    creation_rag, monkeypatch
+):
+    rag = creation_rag
+    await rag.acreate_entity("Atlas", {"description": "Atlas company"})
+    row = await rag.entity_chunks.get_by_id("Atlas")
+    assert row["chunk_ids"] == []
+    assert row["count"] == 0
+
+    await rag.ainsert("Atlas and Borealis: new mountain", ids=["new"])
+    chunk = (await rag.doc_status.get_by_id("new"))["chunks_list"][0]
+    assert (await rag.entity_chunks.get_by_id("Atlas"))["chunk_ids"] == [chunk]
+    assert "Atlas" in (await rag.full_entities.get_by_id("new"))["entity_names"]
+
+    async def unexpected_rebuild(*args, **kwargs):
+        raise AssertionError("The document owns all evidence; delete outright")
+
+    monkeypatch.setattr(
+        "lightrag.lightrag.rebuild_knowledge_from_chunks", unexpected_rebuild
+    )
+    result = await rag.adelete_by_doc_id("new")
+    assert result.status == "success", result.message
+    assert not await rag.chunk_entity_relation_graph.has_node("Atlas")
+    assert await rag.entity_chunks.get_by_id("Atlas") is None

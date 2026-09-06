@@ -6817,6 +6817,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             self.relationships_vdb,
             entity_name,
             entity_data,
+            entity_chunks_storage=self.entity_chunks,
+            relation_chunks_storage=self.relation_chunks,
         )
 
     def create_entity(
@@ -6858,6 +6860,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             source_entity,
             target_entity,
             relation_data,
+            relation_chunks_storage=self.relation_chunks,
         )
 
     def create_relation(

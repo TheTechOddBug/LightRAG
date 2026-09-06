@@ -1689,7 +1689,9 @@ async def acreate_entity(
     """Asynchronously create a new entity.
 
     Creates a new entity in the knowledge graph and adds it to the vector database.
-    Also synchronizes entity_chunks_storage to track chunk references.
+    Replaces entity chunk tracking with the distinct real source IDs supplied
+    for this creation, or an explicit empty row when there are none. Historical
+    no-source placeholders do not count as evidence.
 
     Args:
         chunk_entity_relation_graph: Graph storage instance
@@ -1795,20 +1797,27 @@ async def acreate_entity(
             # Update entity_chunks_storage to track chunk references
             if entity_chunks_storage is not None:
                 source_id = node_data.get("source_id", "")
-                chunk_ids = [cid for cid in source_id.split(GRAPH_FIELD_SEP) if cid]
+                chunk_ids = list(
+                    dict.fromkeys(
+                        cid
+                        for cid in source_id.split(GRAPH_FIELD_SEP)
+                        if cid and cid not in RELATION_NO_EVIDENCE_SOURCE_IDS
+                    )
+                )
 
-                if chunk_ids:
-                    await entity_chunks_storage.upsert(
-                        {
-                            entity_name: {
-                                "chunk_ids": chunk_ids,
-                                "count": len(chunk_ids),
-                            }
+                # Explicit creation starts new attribution, never inherits an
+                # orphan row from a previously deleted object (issue #3838).
+                await entity_chunks_storage.upsert(
+                    {
+                        entity_name: {
+                            "chunk_ids": chunk_ids,
+                            "count": len(chunk_ids),
                         }
-                    )
-                    logger.info(
-                        f"Entity Create: tracked {len(chunk_ids)} chunks for `{entity_name}`"
-                    )
+                    }
+                )
+                logger.info(
+                    f"Entity Create: tracked {len(chunk_ids)} chunks for `{entity_name}`"
+                )
 
             # Save changes
             await _persist_graph_updates(
@@ -1843,7 +1852,9 @@ async def acreate_relation(
     """Asynchronously create a new relation between entities.
 
     Creates a new relation (edge) in the knowledge graph and adds it to the vector database.
-    Also synchronizes relation_chunks_storage to track chunk references.
+    Replaces relation chunk tracking with the distinct real source IDs supplied
+    for this creation, or an explicit empty row when there are none. Orphan rows
+    from a previous relation are never inherited.
 
     Args:
         chunk_entity_relation_graph: Graph storage instance
@@ -1981,18 +1992,19 @@ async def acreate_relation(
                 source_id = edge_data.get("source_id", "")
                 chunk_ids = relation_evidence_source_ids(source_id)
 
-                if chunk_ids:
-                    await relation_chunks_storage.upsert(
-                        {
-                            storage_key: {
-                                "chunk_ids": chunk_ids,
-                                "count": len(chunk_ids),
-                            }
+                # Explicit creation starts new attribution, never inherits an
+                # orphan row from a previously deleted object (issue #3838).
+                await relation_chunks_storage.upsert(
+                    {
+                        storage_key: {
+                            "chunk_ids": chunk_ids,
+                            "count": len(chunk_ids),
                         }
-                    )
-                    logger.info(
-                        f"Relation Create: tracked {len(chunk_ids)} chunks for `{vdb_src}`~`{vdb_tgt}`"
-                    )
+                    }
+                )
+                logger.info(
+                    f"Relation Create: tracked {len(chunk_ids)} chunks for `{vdb_src}`~`{vdb_tgt}`"
+                )
 
             # Save changes
             await _persist_graph_updates(
