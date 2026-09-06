@@ -1,7 +1,8 @@
 """Storage data migration helpers for :class:`LightRAG`.
 
-Mixed into LightRAG and runs once at startup (``initialize_storages`` →
-``check_and_migrate_data``) to upgrade legacy data layouts:
+Mixed into LightRAG. Server startup calls ``check_and_migrate_data`` after
+``initialize_storages`` to upgrade legacy data layouts; SDK explicit creation
+also checks chunk tracking before writing its first new row:
 
 - Backfill ``full_entities`` / ``full_relations`` from the graph + doc_status
   history when those KV stores are empty (entity-relation migration).
@@ -201,6 +202,17 @@ class _StorageMigrationMixin:
         logger.info(
             f"Data migration completed: migrated {migration_count} documents with entities/relations"
         )
+
+    async def _migrate_chunk_tracking_before_creation(self) -> None:
+        """Seed legacy tracking before a new row can suppress empty-store migration.
+
+        SDK callers do not run the server's startup migrations. Use the same
+        migration lock and propagate failures before any creation write. This
+        checks only chunk tracking, not document-anchor migrations, and leaves
+        existing non-empty namespaces (including authoritative empty rows) alone.
+        """
+        async with get_data_init_lock():
+            await self._migrate_chunk_tracking_storage()
 
     async def _migrate_chunk_tracking_storage(self) -> None:
         """Ensure entity/relation chunk tracking KV stores exist and are seeded."""

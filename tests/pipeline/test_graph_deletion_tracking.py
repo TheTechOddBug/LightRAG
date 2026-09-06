@@ -288,3 +288,125 @@ async def test_manual_entity_then_document_is_deleted_without_rebuild(
     assert result.status == "success", result.message
     assert not await rag.chunk_entity_relation_graph.has_node("Atlas")
     assert await rag.entity_chunks.get_by_id("Atlas") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["entity", "relation"])
+@pytest.mark.parametrize("fail_migration", [False, True])
+async def test_sdk_creation_migrates_legacy_tracking_first(
+    creation_rag, monkeypatch, kind, fail_migration
+):
+    rag = creation_rag
+    graph = rag.chunk_entity_relation_graph
+    # Model an upgraded working directory: graph provenance exists on disk,
+    # but neither tracking namespace has been seeded yet.
+    for name in ("LegacyA", "LegacyB"):
+        await graph.upsert_node(
+            name,
+            {"entity_id": name, "description": name, "source_id": "legacy-chunk"},
+        )
+    await graph.upsert_edge(
+        "LegacyA",
+        "LegacyB",
+        {"description": "legacy", "source_id": "legacy-chunk", "weight": 1.0},
+    )
+    await graph.index_done_callback()
+    assert await rag.entity_chunks.is_empty()
+    assert await rag.relation_chunks.is_empty()
+
+    async def create():
+        if kind == "entity":
+            await rag.acreate_entity("Manual", {"description": "manual"})
+        else:
+            await rag.acreate_relation(
+                "LegacyA", "ManualTarget", {"description": "manual"}
+            )
+
+    if kind == "relation":
+        await graph.upsert_node(
+            "ManualTarget",
+            {"entity_id": "ManualTarget", "description": "target", "source_id": ""},
+        )
+        await graph.index_done_callback()
+
+    if fail_migration:
+
+        async def fail_read():
+            raise OSError("legacy graph read unavailable")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(graph, "get_all_nodes", fail_read)
+            with pytest.raises(OSError, match="legacy graph read unavailable"):
+                await create()
+        assert not await graph.has_node("Manual")
+        assert not await graph.has_edge("LegacyA", "ManualTarget")
+        assert await rag.entity_chunks.is_empty()
+        assert await rag.relation_chunks.is_empty()
+
+    await create()
+    # Reopening the stores and invoking the same migration as server startup
+    # must preserve both historical provenance and the new authoritative empty row.
+    await rag.finalize_storages()
+    reopened = LightRAG(
+        working_dir=rag.working_dir,
+        workspace=rag.workspace,
+        llm_model_func=_no_llm,
+        embedding_func=EmbeddingFunc(embedding_dim=8, func=_embed),
+        tokenizer=Tokenizer("characters", _Characters()),
+    )
+    await reopened.initialize_storages()
+    try:
+        await reopened.check_and_migrate_data()
+        for name in ("LegacyA", "LegacyB"):
+            assert (await reopened.entity_chunks.get_by_id(name))["chunk_ids"] == [
+                "legacy-chunk"
+            ]
+        key = make_relation_chunk_key("LegacyA", "LegacyB")
+        assert (await reopened.relation_chunks.get_by_id(key))["chunk_ids"] == [
+            "legacy-chunk"
+        ]
+        tracking = (
+            reopened.entity_chunks if kind == "entity" else reopened.relation_chunks
+        )
+        new_key = (
+            "Manual"
+            if kind == "entity"
+            else make_relation_chunk_key("LegacyA", "ManualTarget")
+        )
+        row = await tracking.get_by_id(new_key)
+        assert row["chunk_ids"] == []
+        assert row["count"] == 0
+        persisted = json.loads(Path(tracking._file_name).read_text())
+        assert persisted[new_key]["chunk_ids"] == []
+    finally:
+        await reopened.finalize_storages()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["entity", "relation"])
+async def test_invalid_sdk_creation_does_not_start_migration(
+    creation_rag, monkeypatch, kind
+):
+    rag = creation_rag
+    for name in ("LegacyA", "LegacyB"):
+        await rag.chunk_entity_relation_graph.upsert_node(
+            name, {"entity_id": name, "description": name, "source_id": "legacy-chunk"}
+        )
+
+    async def unexpected_migration():
+        raise AssertionError("Invalid input must be rejected before migration writes")
+
+    monkeypatch.setattr(
+        rag, "_migrate_chunk_tracking_before_creation", unexpected_migration
+    )
+    with pytest.raises(ValueError):
+        if kind == "entity":
+            await rag.acreate_entity(
+                "Manual", {"description": "manual", "source_id": []}
+            )
+        else:
+            await rag.acreate_relation(
+                "LegacyA", "LegacyB", {"description": "manual", "weight": -1}
+            )
+    assert await rag.entity_chunks.is_empty()
+    assert await rag.relation_chunks.is_empty()

@@ -6817,6 +6817,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             self.relationships_vdb,
             entity_name,
             entity_data,
+            before_create=self._migrate_chunk_tracking_before_creation,
             entity_chunks_storage=self.entity_chunks,
             relation_chunks_storage=self.relation_chunks,
         )
@@ -6860,6 +6861,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             source_entity,
             target_entity,
             relation_data,
+            before_create=self._migrate_chunk_tracking_before_creation,
             relation_chunks_storage=self.relation_chunks,
         )
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 import asyncio
-from typing import Any, cast
+from typing import Any, Awaitable, Callable, cast
 
 from .base import DeletionResult
 from .kg.shared_storage import get_storage_keyed_lock
@@ -1685,6 +1685,8 @@ async def acreate_entity(
     entity_data: dict[str, Any],
     entity_chunks_storage=None,
     relation_chunks_storage=None,
+    *,
+    before_create: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Asynchronously create a new entity.
 
@@ -1701,6 +1703,7 @@ async def acreate_entity(
         entity_data: Dictionary containing entity attributes, e.g. {"description": "description", "entity_type": "type"}
         entity_chunks_storage: Optional KV storage for tracking chunks that reference this entity
         relation_chunks_storage: Optional KV storage for tracking chunks that reference relations
+        before_create: Optional migration hook, awaited after validation and before writes
 
     Returns:
         Dictionary containing created entity information
@@ -1788,6 +1791,9 @@ async def acreate_entity(
                 }
             }
 
+            if before_create is not None:
+                await before_create()
+
             # Add entity to knowledge graph
             await chunk_entity_relation_graph.upsert_node(entity_name, node_data)
 
@@ -1848,6 +1854,8 @@ async def acreate_relation(
     target_entity: str,
     relation_data: dict[str, Any],
     relation_chunks_storage=None,
+    *,
+    before_create: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Asynchronously create a new relation between entities.
 
@@ -1867,6 +1875,7 @@ async def acreate_relation(
             values in ``source_id``. An omitted ``source_id`` is stored as an
             empty string and permits a non-negative fractional weight.
         relation_chunks_storage: Optional KV storage for tracking chunks that reference this relation
+        before_create: Optional migration hook, awaited after validation and before writes
 
     Returns:
         Dictionary containing created relation information
@@ -1974,6 +1983,9 @@ async def acreate_relation(
                     "file_path": relation_data.get("file_path", "manual_creation"),
                 }
             }
+
+            if before_create is not None:
+                await before_create()
 
             # Add relation to knowledge graph
             await chunk_entity_relation_graph.upsert_edge(
