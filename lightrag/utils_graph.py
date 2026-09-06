@@ -309,6 +309,28 @@ async def _persist_graph_updates(
         )
 
 
+async def _commit_graph_or_raise(chunk_entity_relation_graph, context: str) -> None:
+    """Commit the graph, and refuse to continue unless it actually persisted.
+
+    ``NetworkXStorage.index_done_callback`` does not raise when it declines to
+    write: if another process committed since this one last read the graph, it
+    reloads from disk, DISCARDS the in-memory mutation and returns ``False``.
+    Treating a normal return as proof of a commit would let a deletion whose node
+    is still live go on to drop that node's tracking rows and report success —
+    precisely the state the staging in :func:`adelete_by_entity` exists to
+    prevent, reached with no crash and no error surfaced anywhere.
+
+    Only an explicit ``False`` counts as "did not commit". The base signature is
+    ``-> None``, so backends that simply return nothing are unaffected.
+    """
+    committed = await chunk_entity_relation_graph.index_done_callback()
+    if committed is False:
+        raise RuntimeError(
+            f"{context}: the graph commit was skipped because another process "
+            "updated the graph, so the in-memory deletion was discarded"
+        )
+
+
 async def _sweep_orphan_tracking_row(
     tracking_storage, storage_key: str, description: str
 ) -> bool:
@@ -364,7 +386,9 @@ async def adelete_by_entity(
     ``index_done_callback``, an immediate-write tracking store (Redis/PG) commits
     inside ``delete()`` — so neither ordering the calls nor ordering the flushes
     is sufficient alone. The work is therefore staged: (1) commit the graph
-    object's removal by itself, (2) only then delete and commit the tracking
+    object's removal by itself and verify it actually happened — a graph backend
+    may decline to write and report that by return value rather than by raising
+    (see :func:`_commit_graph_or_raise`), (2) only then delete and commit the tracking
     rows, (3) flush the vector storages last, so a vector failure cannot abort a
     deletion whose node is already durably gone and strand rows the sweep cannot
     reach. A stale vector record is the recoverable, rebuildable residue this
@@ -448,10 +472,10 @@ async def adelete_by_entity(
             # mutation becomes durable: a deferred graph (NetworkX) commits only
             # here, while an immediate-write tracking store (Redis/PG) commits
             # inside `delete()`. Any mixture of the two lets a tracking row die
-            # durably before the node does. Only a completed graph commit is a
-            # safe point to touch tracking at all.
-            await _persist_graph_updates(
-                chunk_entity_relation_graph=chunk_entity_relation_graph
+            # durably before the node does. Only a *confirmed* graph commit is a
+            # safe point to touch tracking at all — hence the checked call.
+            await _commit_graph_or_raise(
+                chunk_entity_relation_graph, f"Entity Delete: '{entity_name}'"
             )
 
             # PHASE 2 — the node is gone for good; drop its tracking rows.
@@ -594,10 +618,11 @@ async def adelete_by_relation(
             )
 
             # Same three ordered phases as adelete_by_entity — see there for why
-            # the graph commit must complete before tracking is touched at all,
-            # and why the vector flush comes last.
-            await _persist_graph_updates(
-                chunk_entity_relation_graph=chunk_entity_relation_graph
+            # the graph commit must be confirmed before tracking is touched at
+            # all, and why the vector flush comes last.
+            await _commit_graph_or_raise(
+                chunk_entity_relation_graph,
+                f"Relation Delete: `{source_entity}`~`{target_entity}`",
             )
 
             if relation_chunks_storage is not None:

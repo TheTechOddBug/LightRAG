@@ -517,3 +517,61 @@ class TestFailedCommitsAreRetried:
 
         assert second.status == "not_found"
         assert RELATION_KEY not in deferred.relation_chunks.disk
+
+
+class TestDeclinedGraphCommitIsAFailure:
+    """A graph backend can decline to write and say so by return value.
+
+    `NetworkXStorage.index_done_callback` returns `False` -- without raising --
+    when another process committed since this one last read the graph: it
+    reloads from disk and discards the in-memory mutation. Reading a normal
+    return as proof of a commit would let the deletion proceed to drop the
+    tracking rows of a node that is still live, and report success.
+    """
+
+    @staticmethod
+    def _decline_graph_commit(fixture, monkeypatch):
+        async def _declined():
+            return False
+
+        monkeypatch.setattr(fixture.graph, "index_done_callback", _declined)
+
+    @pytest.mark.asyncio
+    async def test_entity_delete_fails_when_the_graph_declines_to_commit(
+        self, rag, monkeypatch
+    ):
+        self._decline_graph_commit(rag, monkeypatch)
+
+        result = await rag.delete_entity()
+
+        assert result.status == "fail"
+        assert "discarded" in result.message
+        assert rag.entity_chunks.records[ENTITY] == CHUNKS
+        assert rag.relation_chunks.records[RELATION_KEY] == CHUNKS
+
+    @pytest.mark.asyncio
+    async def test_relation_delete_fails_when_the_graph_declines_to_commit(
+        self, rag, monkeypatch
+    ):
+        self._decline_graph_commit(rag, monkeypatch)
+
+        result = await rag.delete_relation()
+
+        assert result.status == "fail"
+        assert rag.relation_chunks.records[RELATION_KEY] == CHUNKS
+
+    @pytest.mark.asyncio
+    async def test_a_backend_returning_none_is_not_treated_as_a_refusal(
+        self, rag, monkeypatch
+    ):
+        # The base signature is `-> None`; only an explicit False means refusal.
+        async def _committed_quietly():
+            return None
+
+        monkeypatch.setattr(rag.graph, "index_done_callback", _committed_quietly)
+
+        result = await rag.delete_entity()
+
+        assert result.status == "success"
+        assert ENTITY not in rag.entity_chunks.records
+        assert RELATION_KEY not in rag.relation_chunks.records
