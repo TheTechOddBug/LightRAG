@@ -5372,9 +5372,13 @@ def sanitize_and_normalize_extracted_text(
     input_text: str, remove_inner_quotes=False
 ) -> str:
     """Sanitize and normalize extracted text
+
     Args:
         input_text: text string to be processed
-        remove_inner_quotes: whether to strip enclosing inner quotes
+        remove_inner_quotes: whether to remove Chinese quotation marks and
+            English quotation marks adjacent to Chinese characters, and to
+            normalize non-breaking spaces. Matching outer quotation marks are
+            removed regardless of this option.
 
     Returns:
         Sanitized and normalized text string
@@ -5402,19 +5406,19 @@ def normalize_extracted_info(name: str, remove_inner_quotes=False) -> str:
     - Preserve spaces within English text and numbers
     - Replace Chinese parentheses with English parentheses
     - Replace Chinese dash with English dash
-    - Remove English quotation marks from the beginning and end of the text
-    - Remove English quotation marks in and around chinese
-    - Remove Chinese quotation marks
+    - Remove matching outer English/Chinese quotation marks or book title marks
     - Filter out short numeric-only text (length < 3 and only digits/dots)
     - remove_inner_quotes = True
-        remove Chinese quotes
-        remove English quotes in and around chinese
-        Convert non-breaking spaces to regular spaces
-        Convert narrow non-breaking spaces after non-digits to regular spaces
+        - Remove Chinese quotation marks
+        - Remove English quotation marks adjacent to Chinese characters
+        - Convert non-breaking spaces to regular spaces
+        - Convert narrow non-breaking spaces after non-digits to regular spaces
 
     Args:
         name: Entity name to normalize
-        remove_inner_quotes: whether to strip inner/enclosing quotes during normalization
+        remove_inner_quotes: whether to apply the optional quote and
+            non-breaking-space rules above. Matching outer quotation marks are
+            removed regardless of this option.
 
     Returns:
         Normalized entity name
