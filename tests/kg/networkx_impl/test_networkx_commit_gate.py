@@ -428,5 +428,48 @@ async def test_a_failed_notification_is_not_reported_as_a_failed_write(
     persisted = NetworkXStorage.load_nx_graph(storage._graphml_xml_file)
     assert persisted is not None and persisted.has_node("A")
     assert any(
-        "could not be notified" in record.getMessage() for record in caplog.records
+        "publishing that write failed" in record.getMessage()
+        for record in caplog.records
     ), f"the notification failure was not logged: {caplog.text}"
+
+
+async def test_a_failed_writer_flag_reset_is_not_reported_as_a_failed_write(
+    tmp_path, monkeypatch, caplog
+):
+    """The own-flag reset is part of the publication, not part of the write.
+
+    In multiprocess mode ``storage_updated`` is a ``Manager().Value`` proxy, so
+    resetting it is another RPC to the same process whose outage makes
+    ``set_all_update_flags`` fail. Guarding only the notification let the
+    identical failure escape one line later and land in the "write failed"
+    handler -- with the file already on disk, which is the whole point of the
+    guard. Its own consequence is milder still: an unreset flag makes the next
+    ``_get_graph`` reload the file this process just wrote.
+    """
+    storage = await _make_storage(tmp_path)
+    await storage.upsert_node("A", {"entity_id": "A"})
+
+    class _FlagOnADeadManager:
+        @property
+        def value(self):
+            return False
+
+        @value.setter
+        def value(self, _new):
+            raise RuntimeError("manager connection refused")
+
+    monkeypatch.setattr(storage, "storage_updated", _FlagOnADeadManager())
+
+    logger = logging.getLogger("lightrag")
+    monkeypatch.setattr(logger, "propagate", True)
+
+    with caplog.at_level(logging.ERROR, logger="lightrag"):
+        committed = await storage.index_done_callback()
+
+    assert committed is True
+    persisted = NetworkXStorage.load_nx_graph(storage._graphml_xml_file)
+    assert persisted is not None and persisted.has_node("A")
+    assert any(
+        "publishing that write failed" in record.getMessage()
+        for record in caplog.records
+    ), f"the publication failure was not logged: {caplog.text}"

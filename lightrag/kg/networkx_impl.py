@@ -984,22 +984,29 @@ class NetworkXStorage(BaseGraphStorage):
                         await set_all_update_flags(
                             self.namespace, workspace=self.workspace
                         )
+                        # Reset own update flag to avoid self-reloading. Inside
+                        # the same guard on purpose: in multiprocess mode this
+                        # flag is a `Manager().Value` proxy, so the assignment
+                        # is another RPC to the very process whose outage makes
+                        # the call above fail. Guarding only the first one lets
+                        # the identical failure escape one line later.
+                        self.storage_updated.value = False
                     except Exception as e:
                         # Recorded, never raised. Reaching this line means the
                         # write already landed (`on_committed` runs only after
-                        # `fn` succeeded), so only the cross-process reload
-                        # notification failed: other workers keep reading the
-                        # previous snapshot until the next commit anywhere flips
-                        # their flags. That is a visibility lag, not a lost
-                        # write. Raising it would report a durable mutation as
-                        # a failed one, and every caller inherits that lie --
-                        # the deletion paths in utils_graph skip the tracking
-                        # retirement they still owe (leaving a vanished object's
-                        # authoritative rows behind), and _insert_done marks a
-                        # document FAILED whose graph writes are on disk.
+                        # `fn` succeeded), so what failed is the publication of
+                        # that write, not the write: other workers keep reading
+                        # the previous snapshot until the next commit anywhere
+                        # flips their flags, and this process may redundantly
+                        # reload the file it just wrote. Both are visibility
+                        # effects, not a lost write. Raising them would report a
+                        # durable mutation as a failed one, and every caller
+                        # inherits that lie -- the deletion paths in utils_graph
+                        # skip the tracking retirement they still owe (leaving a
+                        # vanished object's authoritative rows behind), and
+                        # _insert_done marks a document FAILED whose graph
+                        # writes are on disk.
                         publish_error.append(e)
-                    # Reset own update flag to avoid self-reloading
-                    self.storage_updated.value = False
 
                 await commit_in_storage_io(
                     lambda: NetworkXStorage.write_nx_graph(
@@ -1010,12 +1017,12 @@ class NetworkXStorage(BaseGraphStorage):
                 if publish_error:
                     logger.error(
                         f"[{self.workspace}] Graph saved to "
-                        f"{self._graphml_xml_file}, but one or more other "
-                        f"processes could not be notified to reload it: "
-                        f"{publish_error[0]}. The notification flips one flag "
-                        "per process, so an unknown remainder of them keeps "
-                        "reading the previous snapshot until the next commit "
-                        "notifies them."
+                        f"{self._graphml_xml_file}, but publishing that write "
+                        f"failed: {publish_error[0]}. The notification flips "
+                        "one flag per process, so an unknown remainder of them "
+                        "keeps reading the previous snapshot until the next "
+                        "commit notifies them; this process may also reload "
+                        "the file it just wrote."
                     )
                 return True  # Return success
             except Exception as e:
