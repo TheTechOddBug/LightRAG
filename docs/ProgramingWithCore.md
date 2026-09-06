@@ -1383,6 +1383,7 @@ When deleting an entity:
 - Removes the entity node from the knowledge graph
 - Deletes all associated relationships
 - Removes related embedding vectors from the vector database
+- Deletes and persists the entity and incident-relation chunk-tracking rows, so recreating the entity does not inherit pre-deletion provenance
 - Maintains knowledge graph integrity
 
 ### Delete Relations
@@ -1398,6 +1399,7 @@ await rag.adelete_by_relation("Google", "Gmail")
 When deleting a relationship:
 - Removes the specified relationship edge
 - Deletes the relationship's embedding vector
+- Deletes and persists its chunk-tracking row regardless of endpoint order, so recreating the relation starts with new provenance
 - Preserves both entity nodes and their other relationships
 
 ### Delete by Document ID
