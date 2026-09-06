@@ -120,6 +120,25 @@ class _VectorStorage:
         await asyncio.sleep(0)
 
 
+class _DeferredKVStorage(_KVStorage):
+    """The default JsonKVStorage's durability: upsert touches memory only.
+
+    ``records`` is the shared in-memory view every process sees; ``persisted``
+    is what a restart would find. Only ``index_done_callback`` moves one to the
+    other, which is what makes the ordering against the graph commit observable
+    at all -- with the immediate-write double above, every write is already on
+    "disk" and the window cannot exist.
+    """
+
+    def __init__(self, tag):
+        super().__init__(tag)
+        self.persisted: dict = {}
+
+    async def index_done_callback(self):
+        await asyncio.sleep(0)
+        self.persisted = {key: dict(value) for key, value in self.records.items()}
+
+
 class _ImmediateWriteGraph:
     """Neo4j / Memgraph / MongoDB / PostgreSQL semantics for the graph store.
 
@@ -238,6 +257,44 @@ class _Fixture:
                 raise _Boom("shared-storage manager is down")
 
         monkeypatch.setattr("lightrag.kg.networkx_impl.set_all_update_flags", _flags)
+
+    def use_deferred_tracking(self):
+        """Swap in KV doubles that persist only on their commit."""
+        for name in ("entity_chunks", "relation_chunks"):
+            source = getattr(self, name)
+            deferred = _DeferredKVStorage(source.tag)
+            deferred.records = dict(source.records)
+            deferred.persisted = {k: dict(v) for k, v in source.records.items()}
+            deferred.timeline = self.timeline
+            setattr(self, name, deferred)
+        return self
+
+    def snapshot_tracking_at_each_graph_commit(self, monkeypatch):
+        """What a restart would find, sampled at every graph commit."""
+        snapshots: list[dict] = []
+        original = self.graph.index_done_callback
+
+        async def _sampled():
+            # The tracking side is read BEFORE the commit and the graph side
+            # AFTER it: that pair is exactly what a process exit right after the
+            # commit would leave behind, since the tracking flush has not run
+            # yet at that instant.
+            on_disk = {
+                "entities": {
+                    key: dict(row) for key, row in self.entity_chunks.persisted.items()
+                },
+                "relations": {
+                    key: dict(row)
+                    for key, row in self.relation_chunks.persisted.items()
+                },
+            }
+            result = await original()
+            on_disk["nodes"] = sorted(self.persisted_graph().nodes())
+            snapshots.append(on_disk)
+            return result
+
+        monkeypatch.setattr(self.graph, "index_done_callback", _sampled)
+        return snapshots
 
     def cancel_caller_on_graph_commit(self, monkeypatch, caller, *, after: int = 0):
         """Cancel ``caller`` from inside a graph commit that really landed.
@@ -735,3 +792,73 @@ class TestADurableMergeIsNeverReportedAsNotHavingHappened:
             await rag.merge_via_edit()
 
         assert SOURCE not in rag.persisted_graph().nodes()
+
+
+class TestMigratedRowsAreDurableBeforeTheRemovalCommit:
+    """The new keys must reach disk before the commit that removes the old ones.
+
+    On the default `JsonKVStorage` an upsert only updates shared memory; the
+    rows land on disk in `index_done_callback`. With the tracking flush after
+    the graph commit, a process exit in between came back to the new graph with
+    only the OLD keys on disk: the surviving entity and its relations had no
+    authoritative tracking at all, leaving a purge to read the KEEP-truncated
+    graph `source_id` instead.
+
+    Flushing the migrated rows first inverts the residue into the harmless one
+    this file already accepts elsewhere: rows on disk for objects that do not
+    exist yet, which a retry overwrites.
+    """
+
+    @pytest.mark.asyncio
+    async def test_merge_persists_the_target_rows_before_removing_the_source(
+        self, rag, monkeypatch
+    ):
+        rag.use_deferred_tracking()
+        # Give the source a chunk the target does not have, so "the target's row
+        # is on disk" can only be satisfied by the MIGRATED row: the target key
+        # already exists from the fixture, and asserting its mere presence would
+        # pass without any migration having been persisted at all.
+        only_the_source = {"chunk_ids": ["chunk-src"], "count": 1}
+        rag.entity_chunks.records[SOURCE] = dict(only_the_source)
+        rag.entity_chunks.persisted[SOURCE] = dict(only_the_source)
+        source_relation = make_relation_chunk_key(SOURCE, OTHER)
+        rag.relation_chunks.records[source_relation] = dict(only_the_source)
+        rag.relation_chunks.persisted[source_relation] = dict(only_the_source)
+
+        snapshots = rag.snapshot_tracking_at_each_graph_commit(monkeypatch)
+
+        await rag.merge()
+
+        removal = [s for s in snapshots if SOURCE not in s["nodes"]]
+        assert removal, f"no commit removed the source; snapshots={snapshots}"
+        at_removal = removal[0]
+        target_row = at_removal["entities"].get(TARGET, {})
+        assert "chunk-src" in target_row.get("chunk_ids", []), (
+            "the source was removed while the target's merged tracking row "
+            f"existed only in memory; snapshot={at_removal}"
+        )
+        merged_relation = at_removal["relations"].get(
+            make_relation_chunk_key(TARGET, OTHER), {}
+        )
+        assert "chunk-src" in merged_relation.get("chunk_ids", []), (
+            "the redirected relation's merged row was not on disk when the "
+            f"source was removed; snapshot={at_removal}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rename_persists_the_new_rows_before_removing_the_old_name(
+        self, rag, monkeypatch
+    ):
+        rag.use_deferred_tracking()
+        snapshots = rag.snapshot_tracking_at_each_graph_commit(monkeypatch)
+
+        await rag.rename()
+
+        removal = [s for s in snapshots if SOURCE not in s["nodes"]]
+        assert removal, f"no commit removed the old name; snapshots={snapshots}"
+        at_removal = removal[0]
+        assert RENAMED in at_removal["entities"].keys(), (
+            "the old name was removed while the renamed entity's tracking row "
+            f"existed only in memory; snapshot={at_removal}"
+        )
+        assert make_relation_chunk_key(RENAMED, OTHER) in at_removal["relations"].keys()

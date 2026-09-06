@@ -1062,6 +1062,26 @@ async def _edit_entity_impl(
     # is the fix for the opposite failure (#3609), where a crash left the row
     # under neither key. An orphaned new-key row is dead bookkeeping a retry
     # overwrites; a live object with no row is the bug.
+    # Same staging as the merge: the migrated rows have to be on disk before the
+    # commit that removes the objects the old rows describe. A deferred KV
+    # backend keeps them in shared memory until this flush, so a process exit
+    # between the commit and it would restart with the renamed graph and only
+    # the old keys' rows -- the surviving node and its relations with no
+    # authoritative tracking at all.
+    if is_renaming:
+        try:
+            await _persist_graph_updates(
+                entity_chunks_storage=entity_chunks_storage,
+                relation_chunks_storage=relation_chunks_storage,
+            )
+        except Exception as e:
+            raise VectorStorageConsistencyError(
+                f"Persisting the migrated chunk tracking failed while renaming "
+                f"`{original_entity_name}` to `{new_entity_name}`: {e}. The old "
+                "node was NOT removed and still carries its chunk tracking, so "
+                "nothing has lost its provenance. Retry the rename."
+            ) from e
+
     async def _commit_rename_and_retire_tracking() -> None:
         # `entity_name` has been rebound to the new name by now, so the removal
         # names the original explicitly.
@@ -2579,6 +2599,28 @@ async def _merge_entities_impl(
     # overwritten by a retry; a row that is absent while its object lives is the
     # bug. Both invariants hold with the upserts before the commit and the
     # deletes after it.
+    # Make the migrated rows durable BEFORE the commit that removes the objects
+    # the old rows describe. On a deferred KV backend (the default
+    # JsonKVStorage) an upsert only touches shared memory, so without this the
+    # commit below would publish the new graph while the surviving objects' rows
+    # existed nowhere on disk -- and a process exit in between would come back
+    # to a graph whose entities have no authoritative tracking at all, falling
+    # back to the KEEP-truncated graph source_id a purge can misread. Flushing
+    # first leaves the opposite residue: new rows on disk for objects that do
+    # not exist yet, which is dead bookkeeping a retry overwrites.
+    try:
+        await _persist_graph_updates(
+            entity_chunks_storage=entity_chunks_storage,
+            relation_chunks_storage=relation_chunks_storage,
+        )
+    except Exception as e:
+        raise VectorStorageConsistencyError(
+            f"Persisting the migrated chunk tracking failed while finalizing the "
+            f"merge into '{target_entity}': {e}. The source entities were NOT "
+            "removed and still carry their chunk tracking, so nothing has lost "
+            "its provenance. Retry the merge; it is idempotent from this state."
+        ) from e
+
     async def _commit_source_removal_and_retire_tracking() -> None:
         # The node removals belong INSIDE the region, not before it: on an
         # immediate-write graph backend they are durable as they run, so a
